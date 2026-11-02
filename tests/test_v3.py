@@ -159,6 +159,11 @@ class ProfileTests(unittest.TestCase):
         n = self.conn.execute(f"SELECT COUNT(*) FROM items WHERE {where}", args).fetchone()[0]
         self.assertEqual(n, 1)
 
+    def test_profile_filter_scopes_whole_views(self):
+        where, args = server.build_filter({"view": "all", "profile": "voice"})
+        rows = self.conn.execute(f"SELECT DISTINCT profile FROM items WHERE {where}", args).fetchall()
+        self.assertEqual([r[0] for r in rows], ["voice"])
+
 
 class DoctorTests(unittest.TestCase):
     def setUp(self):

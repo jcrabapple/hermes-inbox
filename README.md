@@ -54,7 +54,8 @@ Hermes databases are opened **read-only**. Nothing under your Hermes home is eve
   run of the same job, so a monitoring report that grew one line shows you that line.
 - **Every profile, one inbox.** Cron jobs, artifacts and state from all Hermes profiles
   (`~/.hermes/profiles/*`) are indexed alongside the default home and tagged with the
-  profile name.
+  profile name. Once a second profile has cron activity, a filter row appears at the top
+  of the inbox to scope the feed to one profile.
 - **Needs attention.** Failed runs, blocked or abandoned kanban tasks, and reports that open
   with DEGRADED, FAILED, "action needed", "needs your decision" or a leading warning emoji
   are flagged. Negations like "no action needed" aren't. In a streak of identical alerts only

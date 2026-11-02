@@ -92,6 +92,7 @@ JOB_MODELS = {
     "e5f6a1b2c3d4": ("z-ai/glm-5.3-flash", 0.0007),
     "f6a1b2c3d4e5": ("z-ai/glm-5.3-flash", 0.0026),
     "a7b8c9d0e1f2": ("anthropic/claude-haiku-5.5", 0.0188),
+    "c9d0e1f2a3b4": ("deepseek/deepseek-v4.1-flash", 0.0062),
 }
 
 KANBAN = [
@@ -102,6 +103,57 @@ KANBAN = [
     ("t_3", "Migrate image uploads to object storage", "coder", "blocked", 1.2,
      "Blocked: needs the storage bucket credentials before the migration can run."),
 ]
+
+# A second profile with its own cron job, so profile tags and the profile filter
+# have something to show in screenshots.
+PROFILE = ("writer", "c9d0e1f2a3b4", "Reading Queue Digest", "0 7 * * 1")
+PROFILE_RUNS = [
+    (5.5, "Reading queue: 14 items, 3 worth your time\n\n"
+     "1. **Postgres query plans in plain English** — directly useful for the FeedEcho slow page.\n"
+     "2. A field guide to self-hosting DNS.\n3. Why small banks write better software.\n\n"
+     "The other 11 were skimmed and filed. Digest emailed."),
+    (29.5, "Reading queue: 12 items, 2 worth your time\n\n"
+     "1. **CSVs considered harmful, again** — links to the RFC quote we argued about.\n"
+     "2. Letter writing as an engineering habit.\n\nDigest emailed."),
+]
+
+
+def write_profile(home: Path):
+    """A writer profile with its own cron job, sessions and state.db."""
+    prof, jid, job, sched = PROFILE
+    pdir = home / "profiles" / prof
+    out = pdir / "cron" / "output" / jid
+    out.mkdir(parents=True, exist_ok=True)
+    (pdir / "cron" / "jobs.json").write_text(json.dumps(
+        {"jobs": [{"id": jid, "name": job, "enabled": True, "deliver": "local",
+                   "schedule": {"kind": "cron", "display": sched}}]}))
+    conn = sqlite3.connect(pdir / "state.db")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, cwd TEXT, display_name TEXT,
+            model TEXT, billing_provider TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER, reasoning_tokens INTEGER, estimated_cost_usd REAL, actual_cost_usd REAL,
+            api_call_count INTEGER, started_at REAL, ended_at REAL, parent_session_id TEXT);
+    """)
+    model, cost = JOB_MODELS[jid]
+    for n, (hours, resp) in enumerate(PROFILE_RUNS):
+        ts = NOW - hours * H
+        head = f"# Cron Job: {job}\n\n**Job ID:** {jid}\n**Run Time:** {stamp(ts, '%Y-%m-%d %H:%M:%S')}\n"
+        text = head + f"**Schedule:** {sched}\n\n## Prompt\n\nRun the job.\n\n" \
+                      f"**Response Characters:** {len(resp)}\n## Response\n\n{resp}\n"
+        f = out / f"{stamp(ts, '%Y-%m-%d_%H-%M-%S')}.md"
+        f.write_text(text)
+        os.utime(f, (ts, ts))
+        wobble = 0.8 + (n * 41 % 50) / 100
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (id, source, title, cwd, display_name, model, billing_provider, "
+            "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, "
+            "estimated_cost_usd, actual_cost_usd, api_call_count, started_at, ended_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"demo-{prof}-{n}", "cron", f"{job} · {stamp(ts, '%b %d %H:%M')}", None, None, model, "openrouter",
+             int(8000 * wobble), int(600 * wobble), int(26000 * wobble), 0, 0, round(cost * wobble, 6), None,
+             3, ts - 40, ts))
+    conn.commit()
+    conn.close()
 
 
 def stamp(ts: float, fmt: str) -> str:
@@ -210,6 +262,7 @@ def main():
     write_cron(home)
     write_chats(home)
     write_sessions(home)
+    write_profile(home)
     write_kanban(home)
     print(f"Demo Hermes home written to {home}")
 

@@ -2,6 +2,14 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+### Added
+- **Profile filter.** Once more than one profile has cron activity, a chip row at the top
+  of the list scopes any view (and its exports and bulk actions) to one profile. The row
+  stays hidden while only the default profile has cron jobs. Demo data now includes a
+  second profile so the feature is visible in screenshots.
+
 ## 2.1.0 (2026-11-02)
 
 ### Added

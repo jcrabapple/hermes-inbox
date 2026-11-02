@@ -30,7 +30,7 @@ const STATUS_TAG = {
 };
 
 const state = {
-  route: { view: '__init__' }, q: '', ftype: '', noise: false,
+  route: { view: '__init__' }, q: '', ftype: '', noise: false, profile: '',
   items: [], next: null, total: 0, unread: 0, selected: null, summary: null,
   showAllJobs: false, listSeq: 0, listScroll: 0,
 };
@@ -217,6 +217,7 @@ function listParams(before) {
   if (r.group) p.set('group', r.group);
   if (r.profile) p.set('profile', r.profile);
   else if (r.group) p.set('profile', 'default');
+  else if (state.profile) p.set('profile', state.profile);
   if (state.q) p.set('q', state.q);
   if (state.ftype) p.set('ftype', state.ftype);
   if (state.noise) p.set('noise', '1');
@@ -240,12 +241,26 @@ async function loadList(reset) {
     if (seq === state.listSeq) $('#list').innerHTML = `<div class="list-msg"><strong>Couldn't load items</strong>${esc(e.message)}</div>`;
   }
 }
+function knownProfiles() {
+  // Profiles with cron activity (kanban worker profiles are not clutter for this filter).
+  const set = new Set(['default']);
+  for (const g of state.summary?.groups || []) if (g.source === 'cron') set.add(g.profile);
+  return [...set];
+}
+
 function renderFilters() {
   const r = state.route; let html = '';
+  const profiles = knownProfiles();
+  if (!r.group && profiles.length > 1) {
+    // Profile chips: the chips row only appears once a second profile exists.
+    html += `<button class="chip" type="button" data-profile="" aria-pressed="${!state.profile}" title="All profiles">All</button>`
+      + profiles.filter((p) => p !== 'default').sort().map((p) =>
+        `<button class="chip" type="button" data-profile="${esc(p)}" aria-pressed="${state.profile === p}">${esc(p)}</button>`).join('');
+  }
   if (r.source === 'artifact') {
-    html = FTYPES.map(([k, l]) => `<button class="chip" type="button" data-ftype="${k}" aria-pressed="${state.ftype === k}">${l}</button>`).join('');
+    html += FTYPES.map(([k, l]) => `<button class="chip" type="button" data-ftype="${k}" aria-pressed="${state.ftype === k}">${l}</button>`).join('');
   } else if (!r.group && ['inbox', 'all'].includes(r.view) && r.source !== 'note') {
-    html = `<button class="chip" type="button" data-noise aria-pressed="${state.noise}" title="Skipped, silent and same-as-last-time runs">Show quiet runs</button>`;
+    html += `<button class="chip" type="button" data-noise aria-pressed="${state.noise}" title="Skipped, silent and same-as-last-time runs">Show quiet runs</button>`;
   }
   $('#filters').innerHTML = html;
 }
@@ -690,6 +705,7 @@ async function markAll() {
   if (isNarrow() && !confirm(`Mark ${state.unread} item${state.unread === 1 ? '' : 's'} as read?`)) return;
   const r = state.route;
   const filter = { view: r.view, ...(r.source ? { source: r.source } : {}), ...(r.group ? { group: r.group, profile: r.profile || 'default' } : {}),
+    ...(!r.group && state.profile ? { profile: state.profile } : {}),
     ...(state.q ? { q: state.q } : {}), ...(state.ftype ? { ftype: state.ftype } : {}), ...(state.noise ? { noise: '1' } : {}) };
   const res = await post('/api/bulk', { action: 'read', filter });
   state.items.forEach((x) => { x.read = 1; });
@@ -764,7 +780,9 @@ $('#list').addEventListener('click', (e) => {
 $('#item').addEventListener('click', (e) => { const b = e.target.closest('[data-act]'); if (b && !b.disabled) act(b.dataset.act); });
 $('#filters').addEventListener('click', (e) => {
   const c = e.target.closest('.chip'); if (!c) return;
-  if (c.hasAttribute('data-noise')) state.noise = !state.noise; else state.ftype = c.dataset.ftype;
+  if (c.hasAttribute('data-noise')) state.noise = !state.noise;
+  else if (c.hasAttribute('data-profile')) state.profile = c.dataset.profile;
+  else state.ftype = c.dataset.ftype;
   loadList(true);
 });
 $('#btn-markall').addEventListener('click', markAll);
