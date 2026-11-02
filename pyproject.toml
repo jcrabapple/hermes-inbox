@@ -14,6 +14,7 @@ requires-python = ">=3.10"
 dependencies = []
 keywords = ["hermes-agent", "inbox", "cron", "self-hosted", "ai-agent"]
 classifiers = [
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Web Environment",
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
