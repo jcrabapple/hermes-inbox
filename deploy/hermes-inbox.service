@@ -1,0 +1,24 @@
+# systemd user unit. Install:
+#   cp deploy/hermes-inbox.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hermes-inbox
+# Adjust ExecStart if you installed with pip/pipx (then just: ExecStart=%h/.local/bin/hermes-inbox serve).
+[Unit]
+Description=Hermes Inbox (cron results, chat artifacts, kanban hand-offs in one inbox)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hermes-inbox
+# Hermes exports its own PYTHONPATH in some shells; a foreign interpreter must not inherit it.
+UnsetEnvironment=PYTHONPATH
+Environment=HERMES_INBOX_HOST=127.0.0.1
+Environment=HERMES_INBOX_PORT=8941
+ExecStart=/usr/bin/python3 -m hermes_inbox serve
+Restart=on-failure
+RestartSec=5
+Nice=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

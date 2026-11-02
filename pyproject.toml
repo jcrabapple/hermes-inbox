@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-inbox"
+dynamic = ["version"]
+description = "One inbox for everything a Hermes Agent does: cron results, chat artifacts, kanban hand-offs and notes."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE.md"]
+authors = [{ name = "Jason Crabtree" }]
+requires-python = ">=3.10"
+dependencies = []
+keywords = ["hermes-agent", "inbox", "cron", "self-hosted", "ai-agent"]
+classifiers = [
+    "Environment :: Web Environment",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/jcrabapple/hermes-inbox"
+Issues = "https://github.com/jcrabapple/hermes-inbox/issues"
+
+[project.scripts]
+hermes-inbox = "hermes_inbox.cli:main"
+
+[tool.setuptools]
+packages = ["hermes_inbox"]
+
+[tool.setuptools.dynamic]
+version = { attr = "hermes_inbox.__version__" }
+
+[tool.setuptools.package-data]
+hermes_inbox = ["static/*", "static/vendor/*"]

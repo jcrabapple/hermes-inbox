@@ -1,0 +1,479 @@
+"""Readers that turn Hermes state into inbox items.
+
+Every reader opens Hermes databases read-only and never writes to ~/.hermes.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+
+BODY_CAP = 300_000
+SCRIPT_CAP = 64_000
+SETTLE_SECONDS = 5  # don't read a cron output file that is still being written
+
+ATTENTION_RE = re.compile(
+    r"\b(DEGRADED|FAILED|FAILURE|OUTAGE|URGENT)\b"
+    r"|(?i:(?<!no )(?<!no operator )\b(?:action (?:needed|required)"
+    r"|needs? your (?:decision|attention|input|approval|review)))"
+    r"|[\u26a0\U0001f6a8\u274c\U0001f534]"
+)
+ATTENTION_WINDOW = 1000  # only the top of a report counts; deep sections quote old incidents
+SILENT_RE = re.compile(r"^\s*(\[SILENT\]|status: silent\b)", re.I)
+MEDIA_RE = re.compile(r"MEDIA:(\S+)")
+PREVIEW_RE = re.compile(r"::preview\{file=\"?([^\"}]+)\"?\}")
+TRAILING = "`'\")]>,.;:*"
+
+ATTENTION_OUTCOMES = {"blocked", "gave_up", "spawn_failed"}
+NOISE_OUTCOMES = {"reclaimed", "released"}
+
+
+# ── helpers ──────────────────────────────────────────────────────────────
+
+def ro_connect(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
+    return conn
+
+
+def hermes_homes(root: Path):
+    """Yield (profile_name, home_path) for the default home and every profile."""
+    yield "default", root
+    prof = root / "profiles"
+    if prof.is_dir():
+        for p in sorted(prof.iterdir()):
+            if p.is_dir():
+                yield p.name, p
+
+
+def strip_md(line: str) -> str:
+    line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
+    line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line)
+    line = re.sub(r"^[#>\-*+\s]+|^\d+\.\s+", "", line)
+    line = re.sub(r"[*`~]+", "", line)
+    line = re.sub(r"(?<!\w)_+|_+(?!\w)", "", line)
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def summarize(text: str, limit: int = 240) -> tuple[str, str]:
+    """Return (subject, preview) from markdown text."""
+    lines = []
+    for raw in text.splitlines():
+        s = strip_md(raw)
+        if not s or set(s) <= set("-=|:"):
+            continue
+        lines.append(s)
+        if sum(len(x) for x in lines) > limit * 2:
+            break
+    if not lines:
+        return "", ""
+    subject = lines[0][:140]
+    preview = " ".join(lines[1:])[:limit] if len(lines) > 1 else ""
+    return subject, preview
+
+
+def norm_hash(text: str) -> str:
+    # Timestamps, counters and ids change every run; strip digits so a
+    # watchdog saying the same thing with a new clock reads as unchanged.
+    t = re.sub(r"\d+", "#", text.strip().lower())
+    t = re.sub(r"\s+", " ", t)
+    return hashlib.sha1(t.encode()).hexdigest()[:16]
+
+
+def local_ts(s: str | None) -> float | None:
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d_%H-%M-%S", "%Y%m%d_%H%M%S"):
+        try:
+            return datetime.strptime(s.strip(), fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+# ── cron ─────────────────────────────────────────────────────────────────
+
+HEADER_RE = re.compile(r"^\*\*(Job ID|Run Time|Schedule|Mode):\*\*\s*(.+?)\s*$", re.M)
+
+
+def _section_after(text: str, marker: str) -> str | None:
+    idx = text.rfind(f"\n{marker}\n")
+    if idx < 0:
+        return None
+    return text[idx + len(marker) + 2:]
+
+
+def parse_cron_output(text: str) -> dict:
+    """Parse a cron/output/<job>/<stamp>.md file into its parts."""
+    first = text.split("\n", 1)[0]
+    name = first[len("# Cron Job:"):].strip() if first.startswith("# Cron Job:") else ""
+    failed_title = name.endswith("(FAILED)")
+    if failed_title:
+        name = name[: -len("(FAILED)")].strip()
+    head = text[:2000]
+    headers = {k: v for k, v in HEADER_RE.findall(head)}
+    out = {
+        "name": name,
+        "job_id": headers.get("Job ID", ""),
+        "run_time": headers.get("Run Time", ""),
+        "schedule": headers.get("Schedule", ""),
+        "mode": headers.get("Mode", ""),
+        "response": None,
+        "error": None,
+        "script_output": None,
+        "kind": "agent",
+    }
+    resp = _section_after(text, "## Response")
+    err = _section_after(text, "## Error")
+    if resp is not None and (err is None or text.rfind("\n## Response\n") > text.rfind("\n## Error\n")):
+        out["response"] = resp.strip()
+    elif err is not None:
+        out["error"] = err.strip()
+        out["kind"] = "error"
+
+    so_idx = text.rfind("\n## Script Output\n")
+    if so_idx >= 0:
+        rest = text[so_idx + len("\n## Script Output\n"):]
+        ends = [i for i in (rest.find("\n**Response Characters:**"), rest.find("\n## Response\n"),
+                            rest.find("\n## Error\n")) if i >= 0]
+        out["script_output"] = rest[: min(ends)] if ends else rest
+        out["script_output"] = out["script_output"].strip()
+
+    if out["response"] is None and out["error"] is None:
+        # No agent turn: either a no_agent script job or a script gate skip.
+        body_start = 0
+        for m in HEADER_RE.finditer(head):
+            body_start = max(body_start, m.end())
+        body = text[body_start:].lstrip()
+        if body.startswith("---"):
+            body = body[3:].lstrip()
+        if "wakeAgent=false" in body[:400]:
+            out["kind"] = "skipped"
+        else:
+            out["kind"] = "script"
+        out["response"] = body.strip()
+    if failed_title and out["kind"] != "error":
+        out["error"] = out["response"] or "Run marked FAILED by the scheduler."
+        out["response"] = None
+        out["kind"] = "error"
+    return out
+
+
+def load_jobs(home: Path) -> dict[str, dict]:
+    path = home / "cron" / "jobs.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    jobs = data.get("jobs", data) if isinstance(data, dict) else data
+    return {j.get("id"): j for j in jobs if isinstance(j, dict) and j.get("id")}
+
+
+BOILERPLATE_RE = re.compile(r"^(generated|report generated|run time|date|timestamp)\b", re.I)
+
+
+def cron_subject(body: str, name: str) -> tuple[str, str]:
+    """Subject + preview for a run, skipping a heading that repeats the job name and
+    "Generated <timestamp> by ..." boilerplate so the list shows what the run found."""
+    lines = body.splitlines()
+    while lines:
+        first = strip_md(lines[0])
+        if not first or first.lower().rstrip(":") == name.lower() or BOILERPLATE_RE.match(first):
+            lines = lines[1:]
+            continue
+        break
+    subject, preview = summarize("\n".join(lines))
+    return (subject or name), preview
+
+
+def cron_item(path: Path, profile: str, jobs: dict, prev_hash: str | None) -> dict:
+    text = path.read_text(errors="replace")
+    p = parse_cron_output(text)
+    job_id = p["job_id"] or path.parent.name
+    job = jobs.get(job_id, {})
+    name = p["name"] or job.get("name") or job_id
+    ts = local_ts(p["run_time"]) or local_ts(path.stem) or path.stat().st_mtime
+
+    status, noise, attention = "ok", False, False
+    body = p["response"] or ""
+    if p["kind"] == "error":
+        status, attention = "failed", True
+        body = "**Run failed.**\n\n```\n" + (p["error"] or "").strip() + "\n```"
+    elif p["kind"] == "skipped":
+        status, noise = "skipped", True
+    elif SILENT_RE.match(strip_md(body.lstrip().split("\n", 1)[0])):
+        status, noise = "silent", True
+    elif not body.strip():
+        status, noise = "empty", True
+
+    rhash = norm_hash(body)
+    if status == "ok":
+        if prev_hash and rhash == prev_hash:
+            status, noise = "unchanged", True
+        elif ATTENTION_RE.search(body[:ATTENTION_WINDOW]):
+            attention = True
+
+    if status == "failed":
+        last = [ln for ln in (p["error"] or "").splitlines() if ln.strip()]
+        subject, preview = "Run failed", (last[-1] if last else "")[:240]
+    elif status == "skipped":
+        subject, preview = "Skipped: script gate found nothing to do", ""
+    elif status == "silent":
+        subject, preview = "Ran silently (nothing to report)", ""
+    else:
+        subject, preview = cron_subject(body, name)
+
+    return {
+        "source": "cron",
+        "source_ref": f"{profile}:{path.parent.name}/{path.name}",
+        "title": subject,
+        "summary": preview,
+        "body": body[:BODY_CAP],
+        "status": status,
+        "attention": attention,
+        "noise": noise,
+        "group_key": job_id,
+        "group_label": name,
+        "profile": profile,
+        "ts": ts,
+        "extra": {
+            "job_id": job_id,
+            "run_time": p["run_time"],
+            "schedule": p["schedule"] or (job.get("schedule") or {}).get("display", ""),
+            "mode": p["mode"],
+            "kind": p["kind"],
+            "deliver": job.get("deliver"),
+            "script_output": (p["script_output"] or "")[:SCRIPT_CAP] or None,
+            "source_path": str(path),
+            "hash": rhash,
+        },
+    }
+
+
+def iter_cron_files(home: Path):
+    outdir = home / "cron" / "output"
+    if not outdir.is_dir():
+        return
+    now = time.time()
+    for jobdir in sorted(outdir.iterdir()):
+        if not jobdir.is_dir():
+            continue
+        files = []
+        for f in jobdir.glob("*.md"):
+            try:
+                if now - f.stat().st_mtime < SETTLE_SECONDS:
+                    continue
+            except OSError:
+                continue
+            files.append(f)
+        yield jobdir.name, sorted(files)
+
+
+# ── chat artifacts ───────────────────────────────────────────────────────
+
+def extract_paths(content: str, cwd: str | None) -> list[str]:
+    found = []
+    for m in MEDIA_RE.finditer(content):
+        found.append(m.group(1))
+    for m in PREVIEW_RE.finditer(content):
+        found.append(m.group(1))
+    out = []
+    for raw in found:
+        p = raw.strip().rstrip(TRAILING)
+        if not p or p.startswith(("http://", "https://", "data:")):
+            continue
+        p = os.path.expanduser(p)
+        if not os.path.isabs(p):
+            if not cwd:
+                continue
+            p = os.path.join(cwd, p)
+        p = os.path.realpath(p)
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def message_context(content: str) -> str:
+    """The assistant's message with the MEDIA directives removed."""
+    text = MEDIA_RE.sub("", content)
+    text = PREVIEW_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()[:20_000]
+
+
+VOLATILE_MARKERS = ("/cache/scratch/", "/tmp/", "/browser-harness/", "/.cache/")
+
+
+def is_volatile(path: str) -> bool:
+    """Scratch/tmp files get overwritten by unrelated work (e.g. every browser screenshot
+    reuses shot.png), so an mtime change there is not a real edit worth resurfacing."""
+    return path.startswith("/tmp/") or any(m in path for m in VOLATILE_MARKERS)
+
+
+def file_facts(path: str) -> dict:
+    mime = mimetypes.guess_type(path)[0] or ""
+    if not mime:
+        ext = Path(path).suffix.lower()
+        mime = {".md": "text/markdown", ".log": "text/plain", ".jsonl": "text/plain",
+                ".yaml": "text/plain", ".yml": "text/plain", ".toml": "text/plain",
+                ".kt": "text/plain", ".ts": "text/plain", ".tsx": "text/plain",
+                ".rs": "text/plain", ".go": "text/plain"}.get(ext, "application/octet-stream")
+    try:
+        st = os.stat(path)
+        return {"mime": mime, "size": st.st_size, "mtime": st.st_mtime, "exists": True}
+    except OSError:
+        return {"mime": mime, "size": None, "mtime": None, "exists": False}
+
+
+def iter_artifact_mentions(home: Path, after_id: int):
+    """Yield (message_id, artifact dict) for MEDIA/preview mentions after a message id."""
+    db = home / "state.db"
+    if not db.exists():
+        return
+    conn = ro_connect(db)
+    try:
+        rows = conn.execute(
+            """SELECT m.id, m.session_id, m.content, m.timestamp,
+                      s.title, s.source, s.cwd, s.display_name
+               FROM messages m JOIN sessions s ON s.id = m.session_id
+               WHERE m.id > ? AND m.role = 'assistant'
+                 AND (m.content LIKE '%MEDIA:%' OR m.content LIKE '%::preview{%')
+               ORDER BY m.id""",
+            (after_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    for r in rows:
+        content = r["content"] or ""
+        for path in extract_paths(content, r["cwd"]):
+            yield r["id"], {
+                "path": path,
+                "session_id": r["session_id"],
+                "session_title": r["title"] or r["display_name"] or "Untitled chat",
+                "platform": r["source"],
+                "ts": r["timestamp"],
+                "context": message_context(content),
+            }
+
+
+def max_message_id(home: Path) -> int:
+    db = home / "state.db"
+    if not db.exists():
+        return 0
+    conn = ro_connect(db)
+    try:
+        return conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def artifact_item(mention: dict, profile: str, existing_extra: dict | None) -> tuple[dict, bool]:
+    """Build an artifact item; returns (item, reopen)."""
+    path = mention["path"]
+    facts = file_facts(path)
+    sessions = list((existing_extra or {}).get("sessions", []))
+    ref = {k: mention[k] for k in ("session_id", "session_title", "platform", "ts")}
+    sessions = [s for s in sessions if s.get("session_id") != ref["session_id"]] + [ref]
+    sessions.sort(key=lambda s: s.get("ts") or 0)
+    prev_mtime = (existing_extra or {}).get("mtime")
+    reopen = (bool(existing_extra) and facts["mtime"] and prev_mtime and facts["mtime"] > prev_mtime + 1
+              and not is_volatile(path))
+    latest = sessions[-1]
+    name = os.path.basename(path)
+    subject, _ = summarize(mention["context"])
+    return {
+        "source": "artifact",
+        "source_ref": path,
+        "title": name,
+        "summary": subject[:240],
+        "body": mention["context"],
+        "status": "missing" if not facts["exists"] else "file",
+        "attention": False,
+        "noise": False,
+        "group_key": latest["session_id"],
+        "group_label": latest["session_title"],
+        "profile": profile,
+        "ts": max(mention["ts"], *(s.get("ts") or 0 for s in sessions)),
+        "extra": {"path": path, **facts, "sessions": sessions[-25:], "origin": "chat"},
+    }, bool(reopen)
+
+
+# ── kanban ───────────────────────────────────────────────────────────────
+
+def board_name(board_dir: Path) -> str:
+    try:
+        return json.loads((board_dir / "board.json").read_text()).get("name") or board_dir.name
+    except (OSError, ValueError):
+        return board_dir.name
+
+
+def kanban_dbs(home: Path):
+    root = home / "kanban.db"
+    if root.exists():
+        yield "default", root, "default"
+    boards = home / "kanban" / "boards"
+    if boards.is_dir():
+        for b in sorted(boards.iterdir()):
+            db = b / "kanban.db"
+            if db.exists():
+                yield b.name, db, board_name(b)
+
+
+def iter_kanban_runs(board: str, db: Path, after_id: int, label: str | None = None):
+    conn = ro_connect(db)
+    try:
+        rows = conn.execute(
+            """SELECT r.id, r.task_id, r.profile, r.status, r.outcome, r.summary,
+                      r.metadata, r.error, r.started_at, r.ended_at,
+                      t.title, t.status AS task_status, t.body, t.assignee
+               FROM task_runs r JOIN tasks t ON t.id = r.task_id
+               WHERE r.id > ? AND r.ended_at IS NOT NULL ORDER BY r.id""",
+            (after_id,),
+        ).fetchall()
+        atts = {}
+        for a in conn.execute("SELECT task_id, filename, stored_path, content_type, created_at FROM task_attachments"):
+            atts.setdefault(a["task_id"], []).append(dict(a))
+    finally:
+        conn.close()
+    for r in rows:
+        outcome = r["outcome"] or r["status"] or "ended"
+        try:
+            meta = json.loads(r["metadata"] or "{}")
+        except ValueError:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        parts = []
+        if r["summary"]:
+            parts.append(r["summary"])
+        if r["error"]:
+            parts.append("**Error**\n\n```\n" + r["error"][:8000] + "\n```")
+        facts = {k: v for k, v in meta.items() if k not in ("worker_output",)}
+        if facts:
+            parts.append("**Run metadata**\n\n```json\n" + json.dumps(facts, indent=2)[:8000] + "\n```")
+        verb = {"completed": "completed", "blocked": "blocked", "review_requested": "ready for review",
+                "crashed": "crashed", "timed_out": "timed out", "gave_up": "gave up"}.get(outcome, outcome)
+        artifacts = [a for a in meta.get("artifacts", []) if isinstance(a, str)] if isinstance(meta.get("artifacts"), list) else []
+        yield r["id"], {
+            "source": "kanban",
+            "source_ref": f"{board}:{r['id']}",
+            "title": f"{r['title']}",
+            "summary": f"{r['profile'] or r['assignee'] or 'worker'} {verb}" + (
+                f": {strip_md(r['summary'])[:200]}" if r["summary"] else ""),
+            "body": "\n\n".join(parts) or f"Run {verb}.",
+            "status": outcome,
+            "attention": outcome in ATTENTION_OUTCOMES,
+            "noise": outcome in NOISE_OUTCOMES,
+            "group_key": board,
+            "group_label": label or board,
+            "ts": float(r["ended_at"]),
+            "extra": {"board": board, "task_id": r["task_id"], "run_id": r["id"],
+                      "profile": r["profile"], "task_status": r["task_status"],
+                      "artifacts": artifacts},
+        }, artifacts, atts.get(r["task_id"], [])

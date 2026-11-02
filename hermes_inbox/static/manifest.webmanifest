@@ -1,0 +1,20 @@
+{
+  "name": "Hermes Inbox",
+  "short_name": "Inbox",
+  "description": "Everything your Hermes agent does, in one inbox.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1a1c21",
+  "theme_color": "#1a1c21",
+  "icons": [
+    { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/static/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Needs attention", "url": "/#/view/attention" },
+    { "name": "Artifacts", "url": "/#/source/artifact" }
+  ]
+}

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1a1c21">
+<title>Sign in · Hermes Inbox</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<script src="/static/theme.js"></script>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-body">
+<form class="login" method="post" action="/login">
+  <svg class="brand-mark big" viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="7" width="26" height="19" rx="4"/><path d="M3 18h7l2 3h8l2-3h7"/><path d="M11 7l5-4 5 4"/></svg>
+  <h1>Hermes Inbox</h1>
+  <p>Paste the access token from <code>~/.config/hermes-inbox/token</code>.</p>
+  <label for="token" class="sr-only">Access token</label>
+  <input id="token" name="token" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus placeholder="Access token">
+  <p class="login-error" id="err" hidden>That token didn't match. Check the file and try again.</p>
+  <button class="btn primary" type="submit">Sign in</button>
+</form>
+<script src="/static/login.js"></script>
+</body>
+</html>
