@@ -2,7 +2,7 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 2.2.0 (2026-11-02)
 
 ### Added
 - **Profile filter.** Once more than one profile has cron activity, a chip row at the top
