@@ -4,6 +4,7 @@ Every reader opens Hermes databases read-only and never writes to ~/.hermes.
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import mimetypes
@@ -22,9 +23,13 @@ ATTENTION_RE = re.compile(
     r"\b(DEGRADED|FAILED|FAILURE|OUTAGE|URGENT)\b"
     r"|(?i:(?<!no )(?<!no operator )\b(?:action (?:needed|required)"
     r"|needs? your (?:decision|attention|input|approval|review)))"
-    r"|[\u26a0\U0001f6a8\u274c\U0001f534]"
 )
 ATTENTION_WINDOW = 1000  # only the top of a report counts; deep sections quote old incidents
+# Alert emojis only count as a headline marker — in the first lines, near the start of a
+# line. Reports ABOUT other reports quote ⚠/🔴 deep in their bodies; those are not alerts.
+EMOJI_RE = re.compile(r"[\u26a0\U0001f6a8\u274c\U0001f534]")
+EMOJI_LINES = 6
+EMOJI_COL = 12
 SILENT_RE = re.compile(r"^\s*(\[SILENT\]|status: silent\b)", re.I)
 MEDIA_RE = re.compile(r"MEDIA:(\S+)")
 PREVIEW_RE = re.compile(r"::preview\{file=\"?([^\"}]+)\"?\}")
@@ -49,7 +54,8 @@ def hermes_homes(root: Path):
     prof = root / "profiles"
     if prof.is_dir():
         for p in sorted(prof.iterdir()):
-            if p.is_dir():
+            # "default" duplicates the root home; ".deleted" holds retired profiles.
+            if p.is_dir() and p.name not in ("default", ".deleted"):
                 yield p.name, p
 
 
@@ -85,6 +91,50 @@ def norm_hash(text: str) -> str:
     t = re.sub(r"\d+", "#", text.strip().lower())
     t = re.sub(r"\s+", " ", t)
     return hashlib.sha1(t.encode()).hexdigest()[:16]
+
+
+def alert_emoji(text: str) -> bool:
+    """True when an alert emoji leads one of the first few lines."""
+    lines = [ln for ln in text.splitlines() if ln.strip()][:EMOJI_LINES]
+    return any(EMOJI_RE.search(ln.lstrip("#>*-`~ \t")[:EMOJI_COL]) for ln in lines)
+
+
+def diff_bodies(old: str, new: str, context: int = 2) -> dict | None:
+    """Line diff of a run against the previous run of the same job.
+
+    Returns hunks (changed lines with a little context) plus totals, or None
+    when the bodies are identical.
+    """
+    a = (old or "").splitlines()[:2000]
+    b = (new or "").splitlines()[:2000]
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=True)
+    added_n = removed_n = 0
+    hunks, cur = [], None
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            if cur:
+                cur["after"] = a[i1:min(i2, i1 + context)]
+                if i2 - i1 > context * 2:
+                    hunks.append(cur)
+                    cur = None
+            continue
+        if cur is None:
+            cur = {"before": a[max(0, i1 - context):i1], "removed": [], "added": [], "after": []}
+        if tag in ("delete", "replace"):
+            cur["removed"] += a[i1:i2]
+        if tag in ("insert", "replace"):
+            cur["added"] += b[j1:j2]
+    if cur:
+        hunks.append(cur)
+    if not hunks:
+        return None
+    for h in hunks:
+        removed_n += len(h["removed"])
+        added_n += len(h["added"])
+        h["removed"] = h["removed"][:40]
+        h["added"] = h["added"][:40]
+    return {"added_n": added_n, "removed_n": removed_n, "hunks": hunks[:6],
+            "more_hunks": max(0, len(hunks) - 6)}
 
 
 def local_ts(s: str | None) -> float | None:
@@ -217,7 +267,7 @@ def cron_item(path: Path, profile: str, jobs: dict, prev_hash: str | None) -> di
     if status == "ok":
         if prev_hash and rhash == prev_hash:
             status, noise = "unchanged", True
-        elif ATTENTION_RE.search(body[:ATTENTION_WINDOW]):
+        elif ATTENTION_RE.search(body[:ATTENTION_WINDOW]) or alert_emoji(body[:ATTENTION_WINDOW]):
             attention = True
 
     if status == "failed":

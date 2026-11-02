@@ -50,9 +50,14 @@ Hermes databases are opened **read-only**. Nothing under your Hermes home is eve
 - **Noise control.** Runs skipped by a script gate, `[SILENT]` runs, and runs whose output
   matches the previous run (ignoring timestamps and counters) stay out of the inbox. They're
   still visible inside each job.
+- **What changed since the last run.** Every run can show a line diff against the previous
+  run of the same job, so a monitoring report that grew one line shows you that line.
+- **Every profile, one inbox.** Cron jobs, artifacts and state from all Hermes profiles
+  (`~/.hermes/profiles/*`) are indexed alongside the default home and tagged with the
+  profile name.
 - **Needs attention.** Failed runs, blocked or abandoned kanban tasks, and reports that open
-  with DEGRADED, FAILED, "action needed", "needs your decision" or a warning emoji are
-  flagged. Negations like "no action needed" aren't. In a streak of identical alerts only
+  with DEGRADED, FAILED, "action needed", "needs your decision" or a leading warning emoji
+  are flagged. Negations like "no action needed" aren't. In a streak of identical alerts only
   the first one is flagged.
 - **Rich previews.** Markdown rendered, images, PDFs, HTML (sandboxed), audio/video,
   text and code, with Open and Download.
@@ -63,6 +68,9 @@ Hermes databases are opened **read-only**. Nothing under your Hermes home is eve
 - **Retention and export.** Quiet runs are deleted after 30 days by default and starred
   items never are. Both windows are configurable. Export any view as JSON or CSV from the
   web app, the CLI or the API.
+- **Live refresh.** The browser fingerprints the sources every few seconds and the server
+  re-indexes only when one actually changed, so new items appear within seconds without
+  busy-polling.
 - **Full-text search** (SQLite FTS5) over everything, including runs whose output files
   Hermes has since deleted.
 - **Phone-first UI.** Bottom tab bar, bottom action bar in the reader, swipe right to toggle
@@ -203,6 +211,7 @@ hermes-inbox [--hermes-home DIR] serve [--host H] [--port P]
 hermes-inbox index          one index pass, prints how many new items it found
 hermes-inbox post TITLE [-b BODY | -] [--level L] [--group NAME] [--link URL]
 hermes-inbox stats          item counts per source
+hermes-inbox doctor         check sources, database and config; exit 1 on failure
 hermes-inbox retitle        recompute run subjects after changing the subject rules
 hermes-inbox token [--show] where the login token lives, or the token itself
 hermes-inbox usage [--days 30]                       cost and models per scheduled job
@@ -278,6 +287,12 @@ python3 tools/contrast.py               # fails if a colour change breaks contra
 To add a source, write a reader in `sources.py` that yields item dicts, add a cursor-based
 `_index_<source>` to `indexer.py`, register it in `SOURCE_META` in `static/app.js`, and
 cover it in `tests/test_inbox.py`.
+
+## Scope guard
+
+Hermes Inbox is deliberately small. Each release may add **no new runtime dependencies,
+no new top-level source module, and no new top-level navigation destination**. A feature
+that can't fit inside that budget is a signal to say no, not to relax the rule.
 
 Hermes Inbox reads Hermes Agent's on-disk formats, which are not a stable public API. If
 an update to Hermes changes them, please open an issue with a sample.

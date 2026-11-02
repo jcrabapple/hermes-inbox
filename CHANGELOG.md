@@ -2,6 +2,31 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
+## 2.1.0 (2026-11-02)
+
+### Added
+- **What changed since the last run.** The reader can show a line diff of a run against
+  the previous run of the same job (context lines, added/removed highlighted), computed
+  server-side by `GET /api/items/<id>`. Runs with no changes show nothing new.
+- **Live refresh.** `GET /api/pulse` fingerprints every watched source (mtime/size of
+  cron output, `jobs.json`, `state.db`, kanban databases) and the web UI polls it every
+  5 seconds while visible; a full index pass runs only when something changed, so new
+  items appear within seconds. The 60-second background pass remains as a backstop.
+- **Profiles.** Cron jobs, artifacts and kanban data from every Hermes profile
+  (`~/.hermes/profiles/*`) are indexed alongside the default home, tagged with the
+  profile name in the UI and filterable with the existing `profile` parameter.
+  Retired (`profiles/.deleted`) and duplicate (`profiles/default`) directories are skipped.
+- **`hermes-inbox doctor`** checks the Hermes home, every profile's cron and state
+  databases, the inbox database (with an integrity check), token file permissions and
+  environment variables, and exits 1 on failure.
+
+### Fixed
+- Alert emoji (⚠ 🚨 ❌ 🔴) now count as an attention signal only when one leads one of the
+  first six lines of a report. Reports *about* other jobs that quote ⚠/🔴 deep in their
+  bodies (log reviews, health digests) no longer get flagged.
+- The reader no longer prints the subject twice when the agent wrapped the title into a
+  longer first body line ("Title — more text").
+
 ## 2.0.0 (2026-11-02)
 
 ### Added

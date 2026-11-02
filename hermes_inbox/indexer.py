@@ -1,6 +1,7 @@
 """Incremental indexer: pulls new items from every Hermes source into the inbox DB."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -23,6 +24,42 @@ _usage_tries: dict[int, int] = {}  # item id -> failed lookups this process (ses
 
 def hermes_root() -> Path:
     return Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+
+
+def fingerprint(root: Path) -> str:
+    """Cheap mtime signature of everything the indexer reads.
+
+    The web UI polls this every few seconds; a full index pass only runs when
+    some watched file actually changed.
+    """
+    parts = []
+    for profile, home in sources.hermes_homes(root):
+        for p in (home / "cron" / "jobs.json", home / "state.db"):
+            try:
+                parts.append(f"{profile}:j:{p.name}:{p.stat().st_mtime_ns}")
+            except OSError:
+                pass
+        outdir = home / "cron" / "output"
+        if outdir.is_dir():
+            for jobdir in sorted(outdir.iterdir()):
+                if not jobdir.is_dir():
+                    continue
+                try:
+                    parts.append(f"{profile}:d:{jobdir.name}:{jobdir.stat().st_mtime_ns}")
+                except OSError:
+                    continue
+                for f in jobdir.glob("*.md"):
+                    try:
+                        st = f.stat()
+                        parts.append(f"{profile}:f:{jobdir.name}/{f.name}:{st.st_mtime_ns}:{st.st_size}")
+                    except OSError:
+                        pass
+        for _, db, _ in sources.kanban_dbs(home):
+            try:
+                parts.append(f"{profile}:k:{db.stat().st_mtime_ns}")
+            except OSError:
+                pass
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()
 
 
 class Indexer:

@@ -140,6 +140,7 @@ class App:
         self.cookie = cookie_value(self.token)
         self._local = threading.local()
         self.index_lock = threading.Lock()
+        self.fingerprint = indexer_mod.fingerprint(self.root)
         store.connect(db_path).close()
 
     def db(self):
@@ -161,6 +162,18 @@ class App:
             finally:
                 conn.close()
 
+    def pulse(self) -> dict:
+        """Called by the web UI every few seconds: index only when something changed."""
+        fp = indexer_mod.fingerprint(self.root)
+        if fp == self.fingerprint:
+            return {"changed": False}
+        self.fingerprint = fp
+        try:
+            self.reindex()
+        except Exception:
+            log.exception("pulse reindex failed")
+        return {"changed": True}
+
     def prune(self, **kw) -> dict:
         with self.index_lock:
             conn = store.connect(self.db_path)
@@ -174,6 +187,7 @@ class App:
         while not stop.is_set():
             try:
                 self.reindex(refresh_files=(n % 10 == 0))
+                self.fingerprint = indexer_mod.fingerprint(self.root)
                 if time.time() - last_prune >= PRUNE_INTERVAL:
                     res = self.prune()
                     last_prune = time.time()
@@ -255,6 +269,11 @@ def make_handler(app: App):
                 return self._static("index.html", csp=True)
             if path == "/api/summary":
                 return self._json(self.summary())
+            if path == "/api/pulse":
+                res = app.pulse()
+                if res.get("changed"):
+                    res["summary"] = self.summary()
+                return self._json(res)
             if path == "/api/items":
                 return self._json(self.list_items(params))
             m = re.fullmatch(r"/api/items/(\d+)", path)
@@ -388,6 +407,11 @@ def make_handler(app: App):
                 prev_ = app.db().execute("SELECT id, ts, status FROM items WHERE source=? AND group_key=? AND ts<? "
                                          "ORDER BY ts DESC LIMIT 1", (d["source"], d["group_key"], d["ts"])).fetchone()
                 d["prev_in_group"] = dict(prev_) if prev_ else None
+            if d["source"] == "cron" and d.get("prev_in_group"):
+                prow = app.db().execute("SELECT body FROM items WHERE id=?",
+                                        (d["prev_in_group"]["id"],)).fetchone()
+                if prow:
+                    d["diff"] = sources.diff_bodies(prow["body"], d["body"])
             return self._json(d)
 
         def update_item(self, iid, data):

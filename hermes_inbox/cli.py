@@ -11,6 +11,7 @@
   hermes-inbox prune [--dry-run] [--quiet-days N] [--keep-days N]
                                            apply the retention policy now
   hermes-inbox export [--format json|csv] [--view all] [--source S] [--group JOB] [--since 30d] [-o FILE]
+  hermes-inbox doctor                     check sources, database and config; exit 1 on failure
 
 Environment: HERMES_HOME (default ~/.hermes), HERMES_INBOX_DATA (default
 $XDG_DATA_HOME/hermes-inbox), HERMES_INBOX_CONFIG (default $XDG_CONFIG_HOME/hermes-inbox),
@@ -66,6 +67,7 @@ def main(argv=None):
     ex.add_argument("--since", help="only items newer than this, e.g. 7d, 12h")
     ex.add_argument("--body", action="store_true", help="include full bodies in CSV")
     ex.add_argument("-o", "--output", help="file to write (default stdout)")
+    sub.add_parser("doctor", help="check sources, database and config")
     t = sub.add_parser("token")
     t.add_argument("--show", action="store_true", help="print the token itself")
     args = ap.parse_args(argv)
@@ -136,6 +138,101 @@ def main(argv=None):
         tok = server.load_token()
         print(tok if args.show else (os.environ.get("HERMES_INBOX_TOKEN") and "set via HERMES_INBOX_TOKEN"
                                      or str(server.config_dir() / "token")))
+    elif args.cmd == "doctor":
+        sys.exit(doctor())
+
+
+def doctor() -> int:
+    """Check every source, the inbox database and the configuration; print a report."""
+    import sqlite3 as sq
+
+    def out(level: str, name: str, detail: str = "") -> None:
+        print(f"{level:5} {name}{(' — ' + detail) if detail else ''}")
+
+    fails = 0
+    root = indexer.hermes_root()
+    if not root.is_dir():
+        out("fail", "hermes home", f"{root} does not exist")
+        return 1
+    out("ok", "hermes home", str(root))
+
+    profiles = list(sources.hermes_homes(root))
+    total_jobs = 0
+    for profile, home in profiles:
+        jobs = sources.load_jobs(home)
+        if not jobs and not (home / "cron" / "jobs.json").exists():
+            out("warn", f"[{profile}] cron", "no jobs.json — nothing scheduled here")
+        else:
+            total_jobs += len(jobs)
+            out("ok", f"[{profile}] cron", f"{len(jobs)} jobs")
+        outdir = home / "cron" / "output"
+        runs = sum(1 for _, files in sources.iter_cron_files(home) for _ in files)
+        out("ok" if outdir.is_dir() else "warn", f"[{profile}] cron output",
+            f"{runs} run files indexed-ready" if outdir.is_dir() else "no output dir")
+        db = home / "state.db"
+        if db.exists():
+            try:
+                conn = sources.ro_connect(db)
+                n = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+                conn.close()
+                out("ok", f"[{profile}] state.db", f"{n} sessions (read-only)")
+            except sq.Error as exc:
+                out("fail", f"[{profile}] state.db", f"cannot read: {exc}")
+                fails += 1
+        else:
+            out("warn", f"[{profile}] state.db", "missing — no chat artifacts or costs from here")
+    out("info", "profiles", ", ".join(p for p, _ in profiles))
+
+    db_path = store.default_db_path()
+    if not db_path.exists():
+        out("fail", "inbox database", f"{db_path} missing — run: hermes-inbox index")
+        return 1
+    try:
+        conn = sq.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sq.Row
+        n = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        per = ", ".join(f"{r['source']} {r['c']}" for r in
+                        conn.execute("SELECT source, COUNT(*) c FROM items GROUP BY source"))
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        conn.close()
+        out("ok" if integrity == "ok" else "fail", "inbox database",
+            f"{db_path}, {n} items ({per}), integrity {integrity}")
+        if integrity != "ok":
+            fails += 1
+    except sq.Error as exc:
+        out("fail", "inbox database", f"cannot open: {exc}")
+        return 1
+
+    from .server import config_dir
+    tok = config_dir() / "token"
+    if tok.exists():
+        mode = oct(tok.stat().st_mode & 0o777)
+        out("ok" if mode == "0o600" else "warn", "token file",
+            f"{tok} (mode {mode})" + ("" if mode == "0o600" else " — should be 0600"))
+    elif os.environ.get("HERMES_INBOX_TOKEN"):
+        out("ok", "token file", "set via HERMES_INBOX_TOKEN")
+    else:
+        out("warn", "token file", "will be created on first serve")
+
+    for name in ("HERMES_INBOX_KEEP_QUIET_DAYS", "HERMES_INBOX_KEEP_DAYS", "HERMES_INBOX_INTERVAL"):
+        v = os.environ.get(name)
+        if v is not None and not v.lstrip("-").isdigit():
+            out("fail", name, f"{v!r} is not an integer")
+            fails += 1
+    conn = sq.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sq.Row
+    last = store.get_meta(conn, "last_index")
+    conn.close()
+    if last:
+        age = time.time() - last["at"]
+        state = "ok" if age < 3 * 60 else "warn"
+        out(state, "last index pass", f"{age:.0f}s ago, took {last.get('took')}s, "
+                                     f"new: {last.get('new')}, priced: {last.get('priced')}")
+    else:
+        out("warn", "last index pass", "never ran — run: hermes-inbox index")
+    out("info", "summary", f"{total_jobs} cron jobs across {len(profiles)} homes; "
+                           f"{fails} failure{'' if fails == 1 else 's'}")
+    return 1 if fails else 0
 
 
 def parse_age(text: str) -> float:

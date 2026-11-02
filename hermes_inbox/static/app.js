@@ -3,6 +3,7 @@
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const normText = (s) => String(s || '').replace(/[*_`~#>]+/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 const icon = (name) => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
 const narrowMQ = window.matchMedia('(max-width: 860px)');
 const isNarrow = () => narrowMQ.matches;
@@ -380,6 +381,17 @@ function renderItem(it) {
 
   if (it.source === 'cron') {
     body += it.body ? `<div class="md">${md(it.body)}</div>` : '<p class="muted">The run produced no output.</p>';
+    if (it.diff && (it.diff.added_n || it.diff.removed_n)) {
+      const dl = (cls, l) => `<div class="dl ${cls}">${esc(l)}</div>`;
+      const hunk = (h) => (h.before || []).map((l) => dl('ctx', l)).join('')
+        + (h.removed || []).map((l) => dl('del', l)).join('')
+        + (h.added || []).map((l) => dl('add', l)).join('')
+        + (h.after || []).map((l) => dl('ctx', l)).join('');
+      body += `<div class="section-title">What changed since the previous run</div>`
+        + `<div class="panel diff">${it.diff.hunks.map(hunk).join('')}`
+        + (it.diff.more_hunks ? `<p class="muted note">… ${it.diff.more_hunks} more changed section${it.diff.more_hunks === 1 ? '' : 's'} not shown</p>` : '')
+        + `</div>`;
+    }
     if (x.script_output) body += `<details class="fold"><summary>Script output</summary><pre>${esc(x.script_output)}</pre></details>`;
     body += '<div class="section-title">Run details</div>' + factRows([
       ['Job', `<a href="${routeHash({ view: 'all', source: 'cron', group: it.group_key, profile: it.profile !== 'default' ? it.profile : '' })}">${esc(it.group_label)}</a> <code class="muted">${esc(x.job_id)}</code>`],
@@ -423,9 +435,21 @@ function renderItem(it) {
   el.dataset.id = it.id;
   el._item = it;
   if (it.source === 'cron') {
-    // The subject is the report's first line; don't print it twice.
+    // The subject is the report's first line; don't print it twice. Agents sometimes
+    // wrap the title into a longer first body line ("Title — more"), so also strip that.
     const first = el.querySelector('.md > :first-child');
-    if (first && first.textContent.trim() === String(it.title).trim() && first.nextElementSibling) first.remove();
+    if (first && first.nextElementSibling) {
+      const t = normText(it.title);
+      const f = normText(first.textContent);
+      if (t && f === t) first.remove();
+      else if (t && f.startsWith(t) && it.title.length < 140 && !first.querySelector('*')) {
+        const rest = first.textContent.trim().slice(String(it.title).trim().length);
+        if (/^\s*[\u2014\u2013:;-]/.test(rest)) {
+          const tail = rest.replace(/^[\s\u2014\u2013:;-]+/, '');
+          if (tail) first.textContent = tail; else first.remove();
+        }
+      }
+    }
   }
   el.hidden = false; $('#reader-empty').hidden = true;
   $('#reader').scrollTop = 0;
@@ -803,17 +827,26 @@ window.addEventListener('hashchange', onRoute);
 narrowMQ.addEventListener('change', () => { const it = current(); if (it) renderItem(it); });
 
 /* ── live refresh ────────────────────────────────── */
-async function poll() {
-  const before = state.summary?.last_index?.at;
-  await loadSummary();
-  const after = state.summary?.last_index?.at;
-  if (!after || after === before || state.q) return;
-  // Only refresh the list when it is visible and scrolled to the top, so nothing jumps under a finger.
-  const listVisible = !isNarrow() || $('#app').dataset.pane === 'list';
-  if (listVisible && $('#list').scrollTop < 40 && !swipe) { await loadList(true); markSelected(); }
+// /api/pulse fingerprints the sources and re-indexes only when one changed, so new
+// items appear within seconds. The 60s background pass stays as a backstop.
+let pulseBusy = false;
+async function pulse() {
+  if (pulseBusy) return;
+  pulseBusy = true;
+  try {
+    const res = await api('/api/pulse');
+    if (!res.changed) return;
+    state.summary = res.summary;
+    renderNav();
+    if (state.page === 'usage' || state.q) return;
+    // Only refresh the list when it is visible and scrolled to the top, so nothing jumps under a finger.
+    const listVisible = !isNarrow() || $('#app').dataset.pane === 'list';
+    if (listVisible && $('#list').scrollTop < 40 && !swipe) { await loadList(true); markSelected(); }
+  } catch (e) { /* server unreachable; the next tick retries */ }
+  finally { pulseBusy = false; }
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
-setInterval(() => { if (!document.hidden) poll(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pulse(); });
+setInterval(() => { if (!document.hidden) pulse(); }, 5000);
 
 (async function init() {
   await loadSummary();
