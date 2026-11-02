@@ -76,6 +76,24 @@ ARTIFACTS = [
      "Seven weeks of distance, steadily climbing."),
 ]
 
+# Two weeks of routine history so the usage chart has something to show.
+for _day in range(2, 15):
+    RUNS.append((0, _day * 24 + 3.2, "agent", "HEALTH=OK\n\nAll 6 checks passed."))
+    RUNS.append((2, _day * 24 + 8.1, "agent", f"Backup finished: {2.2 + _day / 50:.1f} GB snapshot, verified restore."))
+    if _day % 7 == 5:
+        RUNS.append((1, _day * 24 + 5.5, "agent", "Tech digest: 8 stories this week\n\nEmail sent to the digest list."))
+
+# (model, cost per run) used for each job's fake session records
+JOB_MODELS = {
+    "a1b2c3d4e5f6": ("z-ai/glm-5.3-flash", 0.0042),
+    "b2c3d4e5f6a1": ("deepseek/deepseek-v4.1-flash", 0.061),
+    "c3d4e5f6a1b2": ("deepseek/deepseek-v4.1-flash", 0.0093),
+    "d4e5f6a1b2c3": ("z-ai/glm-5.3-flash", 0.0031),
+    "e5f6a1b2c3d4": ("z-ai/glm-5.3-flash", 0.0007),
+    "f6a1b2c3d4e5": ("z-ai/glm-5.3-flash", 0.0026),
+    "a7b8c9d0e1f2": ("anthropic/claude-haiku-5.5", 0.0188),
+}
+
 KANBAN = [
     ("t_1", "Add dark mode to the settings page", "coder", "completed", 4.0,
      "Dark mode added behind the existing theme toggle; 12 tests added, all green."),
@@ -115,6 +133,30 @@ def write_cron(home: Path):
         f = d / f"{stamp(ts, '%Y-%m-%d_%H-%M-%S')}.md"
         f.write_text(text)
         os.utime(f, (ts, ts))
+        if kind != "skipped":
+            SESSIONS.append((jid, name, ts))
+
+
+SESSIONS: list = []
+
+
+def write_sessions(home: Path):
+    """Cron session records with token counts and cost, the way Hermes stores them."""
+    conn = sqlite3.connect(home / "state.db")
+    for n, (jid, name, ts) in enumerate(SESSIONS):
+        model, cost = JOB_MODELS[jid]
+        wobble = 0.8 + (n * 37 % 50) / 100  # deterministic spread so the chart isn't flat
+        dur = 30 + (n * 53 % 200)
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (id, source, title, cwd, display_name, model, billing_provider, "
+            "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, "
+            "estimated_cost_usd, actual_cost_usd, api_call_count, started_at, ended_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"demo-cron-{n}", "cron", f"{name} · {stamp(ts, '%b %d %H:%M')}", None, None, model, "openrouter",
+             int(9000 * wobble), int(700 * wobble), int(30000 * wobble), 0, 0, round(cost * wobble, 6), None,
+             3 + n % 6, ts - dur, ts))
+    conn.commit()
+    conn.close()
 
 
 def write_chats(home: Path):
@@ -122,7 +164,10 @@ def write_chats(home: Path):
     files.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(home / "state.db")
     conn.executescript("""
-        CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, cwd TEXT, display_name TEXT);
+        CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, cwd TEXT, display_name TEXT,
+            model TEXT, billing_provider TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER, reasoning_tokens INTEGER, estimated_cost_usd REAL, actual_cost_usd REAL,
+            api_call_count INTEGER, started_at REAL, ended_at REAL, parent_session_id TEXT);
         CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL);
     """)
     for n, (name, hours, title, content, said) in enumerate(ARTIFACTS, 1):
@@ -131,7 +176,8 @@ def write_chats(home: Path):
         ts = NOW - hours * H
         os.utime(p, (ts, ts))
         sid = f"demo-session-{n}"
-        conn.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,NULL)", (sid, ["desktop", "telegram", "cli"][n % 3], title, str(files)))
+        conn.execute("INSERT OR REPLACE INTO sessions (id, source, title, cwd, started_at) VALUES (?,?,?,?,?)",
+                     (sid, ["desktop", "telegram", "cli"][n % 3], title, str(files), ts))
         conn.execute("INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?)", (n, sid, "assistant", f"{said}\n\nMEDIA:{p}\n", ts))
     conn.commit()
     conn.close()
@@ -163,6 +209,7 @@ def main():
     home.mkdir(parents=True, exist_ok=True)
     write_cron(home)
     write_chats(home)
+    write_sessions(home)
     write_kanban(home)
     print(f"Demo Hermes home written to {home}")
 

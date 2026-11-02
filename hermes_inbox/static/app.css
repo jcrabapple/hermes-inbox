@@ -298,6 +298,51 @@ details.fold pre { margin: 6px 0 0; padding: 12px 14px; max-height: 60vh; overfl
 .md img { max-width: 100%; height: auto; border-radius: 6px; }
 .md hr { border: 0; border-top: 1px solid var(--line); margin: 1.6em 0; }
 
+/* export menu */
+.menu-wrap { position: relative; }
+.menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 25; min-width: 180px; padding: 4px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
+}
+.menu a { display: flex; align-items: center; min-height: 36px; padding: 0 12px; border-radius: 7px; color: var(--text); text-decoration: none; font-size: 13.5px; }
+.menu a:hover, .menu a:focus-visible { background: var(--hover); outline: none; }
+.group-usage { margin: -4px 0 0; font-size: 12.5px; color: var(--text-2); }
+
+/* usage page */
+.page-head { display: flex; align-items: center; gap: 4px; margin: 14px 0 10px; }
+.page-head h1 { margin: 0; }
+.page-filters { margin: 0 0 18px; padding: 0; }
+.page-filters .chip { display: inline-flex; align-items: center; text-decoration: none; }
+.usage-hero .big { font-size: 40px; font-weight: 750; letter-spacing: -0.03em; line-height: 1.1; }
+.usage-hero p { margin: 6px 0 0; color: var(--text-2); }
+.note { font-size: 13px; max-width: 70ch; }
+.chart { position: relative; padding-left: 64px; }
+.chart-max, .chart-mid { position: absolute; left: 0; width: 58px; text-align: right; font-size: 11.5px; line-height: 1; }
+.chart-max { top: 12px; transform: translateY(-50%); }
+.chart-mid { top: 72px; transform: translateY(-50%); }
+.bars {
+  display: flex; align-items: flex-end; gap: 3px; height: 132px; padding: 12px 0 0; border-bottom: 1px solid var(--line-strong);
+  background: linear-gradient(var(--line) 0 0) 0 12px / 100% 1px no-repeat, linear-gradient(var(--line) 0 0) 0 72px / 100% 1px no-repeat;
+}
+.bar { flex: 1; min-width: 3px; height: var(--h); background: var(--accent); border-radius: 3px 3px 0 0; opacity: 0.85; }
+.bar:hover { opacity: 1; }
+.bars-axis { display: flex; justify-content: space-between; font-size: 12px; margin: 4px 0 6px 64px; }
+.usage-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); overflow: hidden; }
+.usage-list li + li { border-top: 1px solid var(--line); }
+.usage-list a, .usage-list li > div {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 12px; row-gap: 2px;
+  padding: 10px 14px; color: var(--text); text-decoration: none;
+}
+.usage-list a:hover { background: var(--hover); }
+.usage-list .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.usage-list .amount { font-weight: 700; text-align: right; }
+.usage-list .sub { grid-column: 1 / 3; font-size: 12.5px; }
+.breakdown { list-style: none; margin: -8px 0 18px; padding: 0 16px; font-size: 13px; }
+.breakdown li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; padding: 4px 0; }
+.storage { padding: 12px 16px; font-size: 13.5px; }
+.storage p { margin: 0 0 8px; }
+.storage .preview-actions { margin: 12px 0 2px; }
+
 /* toast: inverted surface, so its text and action use the page background colour */
 .toast {
   position: fixed; left: 50%; bottom: calc(22px + var(--safe-bottom)); transform: translate(-50%, 20px); opacity: 0;
@@ -396,6 +441,12 @@ details.fold pre { margin: 6px 0 0; padding: 12px 14px; max-height: 60vh; overfl
     background: var(--panel); border-top: 1px solid var(--line);
   }
   .app[data-pane="item"] .tabbar { display: none; }
+  .app.page-usage[data-pane="item"] .tabbar { display: grid; }
+  .page-head { margin-top: 0; }
+  .usage-hero .big { font-size: 36px; }
+  .usage-list a, .usage-list li > div { padding: 12px 14px; min-height: 44px; }
+  .menu a { min-height: 44px; font-size: 15px; }
+  .group-usage { font-size: 13.5px; }
   .tab {
     position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
     border: 0; background: none; color: var(--muted); font-size: 11.5px; font-weight: 600; text-decoration: none; cursor: pointer;

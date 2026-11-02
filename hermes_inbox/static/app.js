@@ -89,6 +89,7 @@ function md(text) { return DOMPurify.sanitize(marked.parse(String(text || '')));
 /* ── routing ─────────────────────────────────────── */
 function parseHash() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
+  if (parts[0] === 'usage') return { page: 'usage', days: /^\d+$/.test(parts[1] || '') ? Number(parts[1]) : 30 };
   const r = { view: 'inbox' };
   if (parts[0] === 'view' && parts[1]) r.view = parts[1];
   else if (parts[0] === 'source' && parts[1]) { r.view = 'all'; r.source = parts[1]; }
@@ -111,8 +112,22 @@ function sameList(a, b) { return a.view === b.view && a.source === b.source && a
 
 async function onRoute() {
   const r = parseHash();
+  if (r.page === 'usage') {
+    // Usage is a page over the current list: keep the list route, show the report in the reader.
+    closeDrawer();
+    state.page = 'usage';
+    if (state.route.view === '__init__') { state.route = { view: 'inbox' }; await loadList(true); }
+    if ($('#app').dataset.pane !== 'item') state.listScroll = $('#list').scrollTop;
+    $('#app').dataset.pane = 'item';
+    renderNav();
+    showUsage(r.days);
+    return;
+  }
+  const leavingPage = state.page === 'usage';
+  state.page = null;
+  if (leavingPage) renderNav();
   const listChanged = !sameList(r, state.route);
-  const wasItem = $('#app').dataset.pane === 'item';
+  const wasItem = $('#app').dataset.pane === 'item' && !leavingPage;
   state.route = r;
   closeDrawer();
   if (listChanged) {
@@ -123,12 +138,13 @@ async function onRoute() {
   }
   if (r.item && !wasItem) state.listScroll = $('#list').scrollTop; // read before the list gets hidden
   $('#app').dataset.pane = r.item ? 'item' : 'list';
+  $('#app').classList.remove('page-usage');
   if (r.item) {
     openItem(r.item, false);
   } else {
     showEmpty();
     // Phones hide the list while reading; put the reader back where they left it.
-    if (wasItem && !listChanged) requestAnimationFrame(() => { $('#list').scrollTop = state.listScroll; });
+    if ((wasItem || leavingPage) && !listChanged) requestAnimationFrame(() => { $('#list').scrollTop = state.listScroll; });
   }
 }
 
@@ -142,8 +158,10 @@ function navLink(href, label, iconName, badge, { current = false, hot = false, d
 function renderNav() {
   const s = state.summary; const r = state.route;
   if (!s) return;
+  const onPage = state.page === 'usage';
   $('#nav-views').innerHTML = VIEWS.map((v) => navLink(`#/view/${v.id}`, v.label, v.icon,
-    v.badge ? s.views[v.badge] || '' : '', { current: !r.source && r.view === v.id, hot: v.hot })).join('');
+    v.badge ? s.views[v.badge] || '' : '', { current: !onPage && !r.source && r.view === v.id, hot: v.hot })).join('')
+    + navLink('#/usage', 'Usage & storage', 'chart', '', { current: onPage });
   $('#nav-sources').innerHTML = Object.entries(SOURCE_META)
     .filter(([k]) => s.sources[k])
     .map(([k, m]) => navLink(`#/source/${k}`, m.label, m.icon, s.sources[k].unread || '', { current: r.source === k && !r.group })).join('');
@@ -171,7 +189,7 @@ function renderNav() {
   $('#index-status').textContent = li ? `Checked ${ago(li.at)}` : 'Indexing…';
   document.title = s.views.inbox ? `(${s.views.inbox}) Hermes Inbox` : 'Hermes Inbox';
 
-  const tab = r.group ? '' : r.source === 'artifact' ? 'artifact' : r.source ? '' : r.view;
+  const tab = onPage ? 'more' : r.group ? '' : r.source === 'artifact' ? 'artifact' : r.source ? '' : r.view;
   $$('.tab[data-tab]').forEach((t) => t.setAttribute('aria-current', String(t.dataset.tab === tab)));
   $('[data-badge="inbox"]').textContent = s.views.inbox > 99 ? '99+' : s.views.inbox || '';
   $('[data-badge="attention"]').textContent = s.views.attention || '';
@@ -215,6 +233,7 @@ async function loadList(reset) {
     if (seq !== state.listSeq) return;
     state.items = reset ? data.items : state.items.concat(data.items);
     state.next = data.next; state.total = data.total; state.unread = data.unread;
+    if (reset) renderGroupUsage(data.group_usage);
     renderList();
   } catch (e) {
     if (seq === state.listSeq) $('#list').innerHTML = `<div class="list-msg"><strong>Couldn't load items</strong>${esc(e.message)}</div>`;
@@ -369,6 +388,7 @@ function renderItem(it) {
       ['Output file', x.source_path ? `<code>${esc(x.source_path)}</code>` : ''],
       ['Previous run', it.prev_in_group ? `<a href="${routeHash(state.route, it.prev_in_group.id)}">${esc(fullTime(it.prev_in_group.ts))}</a> <span class="tag">${esc(STATUS_TAG[it.prev_in_group.status]?.[1] || 'OK')}</span>` : ''],
     ]);
+    body += runUsage(x.usage, x.kind);
   } else if (it.source === 'artifact') {
     body += artifactPreview(it);
     const sess = (x.sessions || []).slice().reverse();
@@ -442,6 +462,133 @@ async function hydrateTextPreview(it) {
     if (it.extra.mime === 'text/markdown') slot.innerHTML = md(text);
     else slot.outerHTML = `<pre>${esc(text)}</pre>`;
   } catch (e) { slot.innerHTML = `<p class="muted">Preview failed: ${esc(e.message)}</p>`; }
+}
+
+/* ── usage, cost and storage ─────────────────────── */
+const compact = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
+function money(v) {
+  if (v == null) return '—';
+  if (v > 0 && v < 0.01) return '$' + v.toFixed(4);
+  return '$' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function shortModel(m) { return (m || '').split('/').pop(); }
+function duration(s) {
+  if (s == null) return '';
+  if (s < 90) return `${Math.round(s)}s`;
+  if (s < 5400) return `${Math.round(s / 60)} min`;
+  return `${(s / 3600).toFixed(1)} h`;
+}
+function renderGroupUsage(gu) {
+  const el = $('#group-usage');
+  if (!gu || !gu.priced_runs) { el.hidden = true; el.textContent = ''; return; }
+  el.hidden = false;
+  el.textContent = `${money(gu.cost_usd)} over ${gu.priced_runs} priced run${gu.priced_runs === 1 ? '' : 's'} (${money(gu.cost_usd / gu.priced_runs)} each)`
+    + (gu.models.length ? ` · ${gu.models.map(shortModel).join(', ')}` : '');
+}
+function runUsage(u, kind) {
+  if (!u) {
+    if (kind !== 'agent' && kind !== 'error') return '';
+    return '<div class="section-title">Model &amp; cost</div><p class="muted note">No usage recorded for this run. '
+      + 'Hermes keeps cron sessions for about a week, so runs indexed after their session was pruned have no cost data.</p>';
+  }
+  const status = u.cost_status === 'actual' ? '<span class="tag ok">billed</span>' : u.cost_status === 'estimated' ? '<span class="tag">estimated</span>' : '';
+  const tokens = `${compact.format(u.input + u.cache_read + u.cache_write)} in`
+    + (u.cache_read ? ` <span class="muted">(${compact.format(u.cache_read)} cached)</span>` : '')
+    + ` · ${compact.format(u.output)} out` + (u.reasoning ? ` <span class="muted">(${compact.format(u.reasoning)} reasoning)</span>` : '');
+  let html = '<div class="section-title">Model &amp; cost</div>' + factRows([
+    ['Model', `<code>${esc(u.model || 'unknown')}</code>${u.provider ? ` <span class="muted">via ${esc(u.provider)}</span>` : ''}`],
+    ['Cost', `<b>${money(u.cost_usd)}</b> ${status}`],
+    ['Tokens', tokens],
+    ['Duration', esc(duration(u.duration_s))],
+    ['API calls', u.calls ? String(u.calls) : ''],
+    ['Session', `<code>${esc(u.session_id)}</code>${u.sessions > 1 ? ` <span class="muted">+${u.sessions - 1} earlier after compression</span>` : ''}`],
+  ]);
+  if (u.models && u.models.length) {
+    html += '<ul class="breakdown">' + u.models.map((m) => `<li><span><code>${esc(shortModel(m.model))}</code> <span class="muted">${esc(m.task)}</span></span>`
+      + `<span class="muted">${m.calls} call${m.calls === 1 ? '' : 's'}</span><b>${money(m.cost)}</b></li>`).join('') + '</ul>';
+  }
+  return html;
+}
+const RANGES = [[7, '7 days'], [30, '30 days'], [90, '90 days'], [0, 'All time']];
+let usageSeq = 0;
+async function showUsage(days) {
+  const seq = ++usageSeq;
+  const el = $('#item');
+  $('#app').classList.add('page-usage');
+  state.selected = null; markSelected();
+  el._item = null; el.dataset.id = '';
+  el.hidden = false; $('#reader-empty').hidden = true;
+  el.innerHTML = '<p class="muted">Loading usage…</p>';
+  let u;
+  try { u = await api(`/api/usage?days=${days}`); } catch (e) { el.innerHTML = `<p class="notice">Couldn't load usage: ${esc(e.message)}</p>`; return; }
+  if (seq !== usageSeq) return;
+  const span = days ? `in the last ${days} days` : "in total";
+  const unpriced = u.runs - u.priced_runs;
+  const maxDay = Math.max(0.000001, ...u.by_day.map((d) => d.cost));
+  const st = u.storage;
+  const pol = st.policy;
+  const lp = st.last_prune;
+  const srcNames = { cron: ['run', 'runs'], artifact: ['artifact', 'artifacts'], kanban: ['kanban run', 'kanban runs'], note: ['note', 'notes'] };
+  const srcLabel = (k, v) => `${v.toLocaleString()} ${(srcNames[k] || [k, k])[v === 1 ? 0 : 1]}`;
+  const jobLink = (j) => `#/group/cron/${encodeURIComponent(j.group_key)}${j.profile !== 'default' ? '/' + encodeURIComponent(j.profile) : ''}`;
+  el.innerHTML = `
+    <header class="page-head">
+      <button class="icon-btn only-narrow" type="button" data-page-back aria-label="Back">${icon('back')}</button>
+      <h1>Usage &amp; storage</h1>
+    </header>
+    <div class="filters page-filters">${RANGES.map(([d, l]) => `<a class="chip" href="#/usage/${d}" aria-pressed="${d === days}">${l}</a>`).join('')}</div>
+    <section class="usage-hero">
+      <div class="big">${money(u.cost_usd)}</div>
+      <p>spent on <b>${u.runs.toLocaleString()}</b> scheduled run${u.runs === 1 ? "" : "s"} ${span}
+        · ${compact.format(u.tokens_in)} tokens in, ${compact.format(u.tokens_out)} out</p>
+      ${unpriced > 0 ? `<p class="muted note">${unpriced.toLocaleString()} of these runs have no cost data. Hermes keeps cron sessions for about a week, so costs exist only for runs indexed while their session did${u.first_priced_ts ? ` (from ${esc(fullTime(u.first_priced_ts))} on)` : ''}.</p>` : ''}
+    </section>
+    ${u.by_day.length > 1 ? `<div class="section-title">Cost per day</div>
+    <div class="chart">
+      <span class="chart-max muted">${money(maxDay)}</span><span class="chart-mid muted">${money(maxDay / 2)}</span>
+      <div class="bars" role="img" aria-label="Daily cost, highest ${money(maxDay)} per day">${u.by_day.map((d) => `<span class="bar" style="--h:${Math.max(2, Math.round(d.cost / maxDay * 100))}%" title="${esc(d.day)}: ${money(d.cost)} over ${d.runs} runs"></span>`).join('')}</div>
+    </div>
+    <div class="bars-axis muted"><span>${esc(u.by_day[0].day)}</span><span>${esc(u.by_day[u.by_day.length - 1].day)}</span></div>` : ''}
+    <div class="section-title">By job</div>
+    ${u.by_job.length ? `<ul class="usage-list">${u.by_job.map((j) => `<li><a href="${jobLink(j)}">
+        <span class="name">${esc(j.label)}${j.profile !== 'default' ? ` <span class="tag accent">${esc(j.profile)}</span>` : ''}</span>
+        <span class="amount">${j.priced ? money(j.cost) : '—'}</span>
+        <span class="sub muted">${j.runs} run${j.runs === 1 ? '' : 's'}${j.priced && j.priced < j.runs ? ` (${j.priced} priced)` : ''}${j.avg != null ? ` · ${money(j.avg)} per run` : ''}${j.models.length ? ` · ${esc(j.models.map(shortModel).join(', '))}` : ''}</span>
+      </a></li>`).join('')}</ul>` : '<p class="muted">No scheduled runs in this window.</p>'}
+    ${u.by_model.length ? `<div class="section-title">By model</div>
+    <ul class="usage-list">${u.by_model.map((m) => `<li><div>
+        <span class="name"><code>${esc(m.model)}</code></span>
+        <span class="amount">${money(m.cost)}</span>
+        <span class="sub muted">${m.runs} run${m.runs === 1 ? '' : 's'} · ${compact.format(m.tin)} in · ${compact.format(m.tout)} out</span>
+      </div></li>`).join('')}</ul>` : ''}
+    <div class="section-title">Storage</div>
+    <div class="panel storage">
+      <p><b>${bytes(st.db_bytes)}</b> · ${st.items.toLocaleString()} items
+        (${Object.entries(st.by_source).map(([k, v]) => srcLabel(k, v)).join(', ')})
+        · ${st.quiet_items.toLocaleString()} quiet · ${st.starred.toLocaleString()} starred</p>
+      <p class="muted">${pol.quiet_days ? `Quiet runs (skipped, silent, unchanged) are deleted after ${pol.quiet_days} days.` : 'Quiet runs are kept forever.'}
+        ${pol.keep_days ? `Everything else is deleted after ${pol.keep_days} days.` : 'Everything else is kept.'}
+        Starred items are never deleted.</p>
+      <p class="muted">${lp ? (lp.deleted ? `Last cleanup removed ${lp.deleted.toLocaleString()} item${lp.deleted === 1 ? '' : 's'} on ${esc(fullTime(lp.at))}.` : `Last cleanup on ${esc(fullTime(lp.at))} had nothing to remove.`) : 'No cleanup has removed anything yet. It runs hourly.'}</p>
+      <div class="preview-actions">
+        <a class="btn" href="/api/export?view=all&format=json">${icon('download')}Export all (JSON)</a>
+        <a class="btn" href="/api/export?view=all&format=csv">${icon('download')}Export all (CSV)</a>
+      </div>
+    </div>`;
+  $('#reader').scrollTop = 0;
+}
+
+/* ── export menu ─────────────────────────────────── */
+function exportHref(fmt) {
+  const p = listParams(null); p.delete('limit'); p.set('format', fmt);
+  return '/api/export?' + p;
+}
+function toggleExportMenu(open) {
+  const menu = $('#export-menu'); const btn = $('#btn-export');
+  const show = open ?? menu.hidden;
+  if (show) $$('#export-menu a').forEach((a) => { a.href = exportHref(a.dataset.fmt); });
+  menu.hidden = !show; btn.setAttribute('aria-expanded', String(show));
+  if (show) menu.querySelector('a').focus({ preventScroll: true });
 }
 
 /* ── actions ─────────────────────────────────────── */
@@ -597,6 +744,10 @@ $('#filters').addEventListener('click', (e) => {
   loadList(true);
 });
 $('#btn-markall').addEventListener('click', markAll);
+$('#btn-export').addEventListener('click', (e) => { e.stopPropagation(); toggleExportMenu(); });
+$('#export-menu').addEventListener('click', () => toggleExportMenu(false));
+document.addEventListener('click', (e) => { if (!e.target.closest('.menu-wrap')) toggleExportMenu(false); });
+$('#item').addEventListener('click', (e) => { if (e.target.closest('[data-page-back]')) location.hash = routeHash(state.route); });
 $('#jobs-toggle').addEventListener('click', () => { state.showAllJobs = !state.showAllJobs; renderNav(); });
 $('#btn-menu').addEventListener('click', openDrawer);
 $('#btn-drawer-close').addEventListener('click', closeDrawer);
@@ -637,6 +788,8 @@ document.addEventListener('keydown', (e) => {
   if (e.target.matches('input, textarea') || e.metaKey || e.ctrlKey || e.altKey) return;
   const k = e.key;
   if (k === 'Escape' && $('#app').classList.contains('nav-open')) { closeDrawer(); return; }
+  if (k === 'Escape' && !$('#export-menu').hidden) { toggleExportMenu(false); $('#btn-export').focus(); return; }
+  if (state.page === 'usage') { if (k === 'Escape') location.hash = routeHash(state.route); return; }
   if (k === '/') { e.preventDefault(); $('#search').focus(); return; }
   if (k === 'j' || k === 'k') { e.preventDefault(); step(k === 'j' ? 1 : -1); return; }
   if (k === 'e' || k === '#') act('archive');

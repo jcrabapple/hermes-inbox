@@ -8,13 +8,17 @@ import sqlite3
 import time
 from pathlib import Path
 
-from . import sources, store
+from . import sources, store, usage
 
 log = logging.getLogger("hermes_inbox.indexer")
 
 # On the very first index, everything older than this is filed as already read
 # so the inbox opens on recent activity instead of months of backlog.
 BACKFILL_UNREAD_WINDOW = 48 * 3600
+# Hermes prunes cron sessions after about a week; older runs cannot be priced.
+USAGE_LOOKBACK = 8 * 86400
+USAGE_MAX_TRIES = 5
+_usage_tries: dict[int, int] = {}  # item id -> failed lookups this process (session not finalized yet)
 
 
 def hermes_root() -> Path:
@@ -36,12 +40,14 @@ class Indexer:
             store.set_meta(self.conn, "backfill_cutoff", started - BACKFILL_UNREAD_WINDOW)
             self.conn.commit()
         counts = {"cron": 0, "artifact": 0, "kanban": 0}
+        priced = 0
         for profile, home in sources.hermes_homes(self.root):
             counts["cron"] += self._index_cron(profile, home)
             counts["artifact"] += self._index_artifacts(profile, home)
             counts["kanban"] += self._index_kanban(profile, home)
+            priced += self._index_usage(profile, home)
         store.set_meta(self.conn, "last_index", {"at": time.time(), "took": round(time.time() - started, 2),
-                                                 "new": counts})
+                                                 "new": counts, "priced": priced})
         self.conn.commit()
         return counts
 
@@ -87,6 +93,52 @@ class Indexer:
                 changed += 1
         self.conn.commit()
         return changed
+
+    # usage ───────────────────────────────────────────────────────────
+    def _index_usage(self, profile: str, home: Path) -> int:
+        """Attach model, tokens and cost to recent cron runs from their Hermes sessions."""
+        db = home / "state.db"
+        if not db.exists():
+            return 0
+        pending = [r for r in self.conn.execute(
+            """SELECT id, ts, group_key, group_label, extra FROM items
+               WHERE source='cron' AND profile=? AND model IS NULL AND ts > ?
+                 AND json_extract(extra, '$.kind') IN ('agent', 'error')""",
+            (profile, time.time() - USAGE_LOOKBACK)) if _usage_tries.get(r["id"], 0) < USAGE_MAX_TRIES]
+        if not pending:
+            return 0
+        taken = {r[0] for r in self.conn.execute(
+            "SELECT json_extract(extra, '$.usage.session_id') FROM items "
+            "WHERE source='cron' AND profile=? AND model IS NOT NULL", (profile,)) if r[0]}
+        priced = 0
+        try:
+            hconn = sources.ro_connect(db)
+        except sqlite3.Error as exc:
+            log.warning("state.db unavailable for usage (%s): %s", profile, exc)
+            return 0
+        try:
+            for r in pending:
+                try:
+                    sid = usage.find_cron_session(hconn, r["group_label"], r["group_key"], r["ts"], taken)
+                    u = usage.session_usage(hconn, sid) if sid else None
+                except sqlite3.Error as exc:
+                    log.warning("usage lookup failed for item %s: %s", r["id"], exc)
+                    u = None
+                if not u:
+                    _usage_tries[r["id"]] = _usage_tries.get(r["id"], 0) + 1
+                    continue
+                taken.add(u["session_id"])
+                extra = json.loads(r["extra"])
+                extra["usage"] = u
+                self.conn.execute(
+                    "UPDATE items SET model=?, cost_usd=?, tokens_in=?, tokens_out=?, extra=? WHERE id=?",
+                    (u["model"] or "", u["cost_usd"], u["input"] + u["cache_read"] + u["cache_write"],
+                     u["output"], json.dumps(extra), r["id"]))
+                priced += 1
+        finally:
+            hconn.close()
+        self.conn.commit()
+        return priced
 
     # artifacts ───────────────────────────────────────────────────────
     def _existing_extra(self, source: str, ref: str) -> dict | None:

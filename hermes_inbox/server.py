@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import logging
 import mimetypes
 import os
 import re
 import secrets
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -17,8 +19,8 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import export, retention, sources, store
 from . import indexer as indexer_mod
-from . import sources, store
 
 log = logging.getLogger("hermes_inbox.server")
 
@@ -26,7 +28,9 @@ STATIC = Path(__file__).resolve().parent / "static"
 COOKIE = "hermes_inbox"
 INDEX_INTERVAL = int(os.environ.get("HERMES_INBOX_INTERVAL", "60"))
 LIST_FIELDS = ("id", "source", "title", "summary", "status", "attention", "noise", "group_key",
-               "group_label", "profile", "ts", "read", "starred", "archived")
+               "group_label", "profile", "ts", "read", "starred", "archived", "model", "cost_usd")
+PRUNE_INTERVAL = 3600
+USAGE_RUNS = "source='cron' AND json_extract(extra, '$.kind') IN ('agent', 'error')"
 PREVIEW_TEXT_LIMIT = 2_000_000
 SANDBOXED_TYPES = ("text/html", "image/svg+xml", "application/xhtml+xml", "application/xml", "text/xml")
 APP_CSP = ("default-src 'self'; img-src 'self' data: blob: https:; media-src 'self' blob:; "
@@ -157,11 +161,24 @@ class App:
             finally:
                 conn.close()
 
+    def prune(self, **kw) -> dict:
+        with self.index_lock:
+            conn = store.connect(self.db_path)
+            try:
+                return retention.prune(conn, **kw)
+            finally:
+                conn.close()
+
     def index_loop(self, stop: threading.Event):
-        n = 0
+        n, last_prune = 0, 0.0
         while not stop.is_set():
             try:
                 self.reindex(refresh_files=(n % 10 == 0))
+                if time.time() - last_prune >= PRUNE_INTERVAL:
+                    res = self.prune()
+                    last_prune = time.time()
+                    if res["deleted"]:
+                        log.info("retention removed %d items %s", res["deleted"], res["by_source"])
             except Exception:  # keep the loop alive; the next tick retries
                 log.exception("index run failed")
             n += 1
@@ -248,6 +265,10 @@ def make_handler(app: App):
                 return self.serve_file(int(m.group(1)), params)
             if path == "/api/jobs":
                 return self._json(self.jobs())
+            if path == "/api/usage":
+                return self._json(self.usage_report(params))
+            if path == "/api/export":
+                return self.export(params)
             return self._json({"error": "not found"}, 404)
 
         def do_POST(self):
@@ -274,6 +295,8 @@ def make_handler(app: App):
                 return self.add_note(data)
             if path == "/api/reindex":
                 return self._json({"new": app.reindex(refresh_files=True)})
+            if path == "/api/prune":
+                return self._json(app.prune(dry_run=bool(data.get("dry_run"))))
             return self._json({"error": "not found"}, 404)
 
         # ── pages ──
@@ -341,7 +364,16 @@ def make_handler(app: App):
             items = [row_to_list(r) for r in rows[:limit]]
             nxt = f"{rows[limit - 1]['ts']}:{rows[limit - 1]['id']}" if len(rows) > limit else None
             counts = db.execute(f"SELECT COUNT(*), COALESCE(SUM(read=0),0) FROM items WHERE {base}", base_args).fetchone()
-            return {"items": items, "next": nxt, "total": counts[0], "unread": counts[1]}
+            out = {"items": items, "next": nxt, "total": counts[0], "unread": counts[1]}
+            if params.get("group") and params.get("source") == "cron":
+                u = db.execute(f"SELECT COUNT(cost_usd), COALESCE(SUM(cost_usd), 0), MIN(ts) FROM items "
+                               f"WHERE {base} AND cost_usd IS NOT NULL", base_args).fetchone()
+                models = [r[0] for r in db.execute(
+                    f"SELECT model FROM items WHERE {base} AND model IS NOT NULL AND model != '' "
+                    f"GROUP BY model ORDER BY MAX(ts) DESC", base_args)]
+                out["group_usage"] = {"priced_runs": u[0], "cost_usd": round(u[1], 6), "since": u[2],
+                                      "models": models}
+            return out
 
         def get_item(self, iid):
             row = app.db().execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
@@ -406,6 +438,78 @@ def make_handler(app: App):
             })
             app.db().commit()
             return self._json({"ok": True, "id": iid}, 201)
+
+        def usage_report(self, params):
+            db = app.db()
+            try:
+                days = max(0, min(int(params.get("days", 30)), 3650))
+            except ValueError:
+                days = 30
+            since = time.time() - days * 86400 if days else 0
+            win = f"{USAGE_RUNS} AND ts >= ?"
+            tot = db.execute(f"SELECT COUNT(*), COUNT(cost_usd), COALESCE(SUM(cost_usd), 0), "
+                             f"COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0) FROM items WHERE {win}",
+                             (since,)).fetchone()
+            by_job = []
+            for r in db.execute(
+                    f"""SELECT group_key, profile, COUNT(*) runs, COUNT(cost_usd) priced,
+                               COALESCE(SUM(cost_usd), 0) cost, COALESCE(SUM(tokens_in), 0) tin,
+                               COALESCE(SUM(tokens_out), 0) tout, MAX(ts) last_ts
+                        FROM items WHERE {win} GROUP BY group_key, profile
+                        ORDER BY cost DESC, runs DESC""", (since,)):
+                label = db.execute("SELECT group_label FROM items WHERE source='cron' AND group_key=? AND profile=? "
+                                   "ORDER BY ts DESC LIMIT 1", (r["group_key"], r["profile"])).fetchone()[0]
+                models = [m[0] for m in db.execute(
+                    f"SELECT model FROM items WHERE {win} AND group_key=? AND profile=? AND model != '' "
+                    f"AND model IS NOT NULL GROUP BY model ORDER BY COUNT(*) DESC", (since, r["group_key"], r["profile"]))]
+                by_job.append({**dict(r), "label": label, "cost": round(r["cost"], 6),
+                               "avg": round(r["cost"] / r["priced"], 6) if r["priced"] else None, "models": models})
+            by_model = [dict(r) | {"cost": round(r["cost"], 6)} for r in db.execute(
+                f"""SELECT model, COUNT(*) runs, COALESCE(SUM(cost_usd), 0) cost, COALESCE(SUM(tokens_in), 0) tin,
+                           COALESCE(SUM(tokens_out), 0) tout FROM items
+                    WHERE {win} AND model IS NOT NULL AND model != '' GROUP BY model ORDER BY cost DESC""", (since,))]
+            by_day = [{"day": r[0], "cost": round(r[1], 6), "runs": r[2]} for r in db.execute(
+                f"""SELECT date(ts, 'unixepoch', 'localtime') d, COALESCE(SUM(cost_usd), 0), COUNT(*)
+                    FROM items WHERE {win} GROUP BY d ORDER BY d""", (since,))]
+            first_priced = db.execute(f"SELECT MIN(ts) FROM items WHERE {USAGE_RUNS} AND cost_usd IS NOT NULL"
+                                      ).fetchone()[0]
+            return {"days": days, "since": since, "runs": tot[0], "priced_runs": tot[1],
+                    "cost_usd": round(tot[2], 6), "tokens_in": tot[3], "tokens_out": tot[4],
+                    "first_priced_ts": first_priced, "by_job": by_job, "by_model": by_model, "by_day": by_day,
+                    "storage": retention.storage(db, app.db_path or store.default_db_path())}
+
+        def export(self, params):
+            fmt = params.get("format", "json")
+            if fmt not in ("json", "csv"):
+                return self._json({"error": "format must be json or csv"}, 400)
+            where, args = build_filter(params)
+            # A real temp file (not Spooled: on 3.10 it cannot back a TextIOWrapper) gives us Content-Length.
+            with tempfile.TemporaryFile(mode="w+b") as raw:
+                fh = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+                rows = export.rows(app.db(), where, args)
+                if fmt == "json":
+                    export.write_json(rows, fh)
+                else:
+                    export.write_csv(rows, fh, include_body=params.get("body") == "1")
+                fh.flush()
+                size = raw.tell()
+                raw.seek(0)
+                stamp = time.strftime("%Y%m%d-%H%M")
+                name = f"hermes-inbox-{params.get('view', 'inbox')}-{stamp}.{fmt}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8" if fmt == "json"
+                                 else "text/csv; charset=utf-8")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                while True:
+                    chunk = raw.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                fh.detach()
 
         def jobs(self):
             out = []

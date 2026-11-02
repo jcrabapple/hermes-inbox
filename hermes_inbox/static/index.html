@@ -40,6 +40,7 @@
     <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
     <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></symbol>
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
   </defs>
 </svg>
@@ -78,7 +79,15 @@
         <div class="spacer"></div>
         <button class="icon-btn" id="btn-reindex" type="button" title="Check for new items" aria-label="Check for new items"><svg><use href="#i-refresh"/></svg></button>
         <button class="icon-btn" id="btn-markall" type="button" title="Mark all read (Shift+I)" aria-label="Mark everything here as read"><svg><use href="#i-checks"/></svg></button>
+        <div class="menu-wrap">
+          <button class="icon-btn" id="btn-export" type="button" title="Export this view" aria-label="Export this view" aria-haspopup="true" aria-expanded="false" aria-controls="export-menu"><svg><use href="#i-download"/></svg></button>
+          <div class="menu" id="export-menu" role="menu" hidden>
+            <a role="menuitem" data-fmt="json" href="#">Export as JSON</a>
+            <a role="menuitem" data-fmt="csv" href="#">Export as CSV</a>
+          </div>
+        </div>
       </div>
+      <p class="group-usage" id="group-usage" hidden></p>
       <label class="search" id="search-box">
         <svg aria-hidden="true"><use href="#i-search"/></svg>
         <input id="search" type="search" placeholder="Search everything" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search" aria-label="Search">

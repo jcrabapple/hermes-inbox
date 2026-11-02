@@ -2,6 +2,37 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
+## 2.0.0 (2026-11-02)
+
+### Added
+- **Model and cost per run.** Scheduled runs are matched to their Hermes cron session (by
+  job title and finish time, following compression continuations). Each run gets its model,
+  provider, tokens (input, cached, output, reasoning), API calls, duration and cost,
+  including auxiliary models such as compression. Costs are marked as estimated or
+  billed, depending on what Hermes recorded.
+- **Usage & storage page** (`#/usage`, sidebar and the phone's More menu): total spend,
+  cost per day, per job and per model for 7, 30, 90 days or all time, plus database size,
+  item counts and the retention policy.
+- **Cost line on job views:** what a job has cost across its priced runs, and the models
+  it used.
+- **Retention.** An hourly cleanup deletes quiet runs older than
+  `HERMES_INBOX_KEEP_QUIET_DAYS` (default 30) and, optionally, every unstarred item older
+  than `HERMES_INBOX_KEEP_DAYS`. Starred items are never deleted. Pruned runs are
+  tombstoned so the indexer doesn't bring them back from cron output still on disk.
+- **Export** of any view as JSON (full items) or CSV (one row per item, with model and
+  cost columns), from a menu in the list header, the Usage page, `hermes-inbox export`
+  or `GET /api/export`.
+- CLI: `hermes-inbox usage`, `hermes-inbox prune`, `hermes-inbox export`.
+- API: `GET /api/usage`, `GET /api/export`, `POST /api/prune`. List items carry `model`
+  and `cost_usd`, and job lists return `group_usage`.
+- Demo data includes cron session costs.
+
+### Changed
+- **Quiet runs older than 30 days are now deleted by default.** Set
+  `HERMES_INBOX_KEEP_QUIET_DAYS=0` to keep the 1.x behaviour of keeping everything.
+- The database gains `model`, `cost_usd`, `tokens_in` and `tokens_out` columns and a
+  `tombstones` table. The migration runs automatically on first start and is additive.
+
 ## 1.0.0 (2026-11-02)
 
 First stable release.

@@ -58,6 +58,26 @@ CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF title, summary, body, grou
 END;
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+
+-- Refs removed by retention. Cron output files can outlive the item, and without a
+-- tombstone the next index pass would bring a pruned run straight back.
+CREATE TABLE IF NOT EXISTS tombstones (
+    source     TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    pruned_at  REAL NOT NULL,
+    PRIMARY KEY (source, source_ref)
+);
+"""
+
+# Columns added after 1.0. Each is (name, DDL type); connect() adds any that are missing.
+MIGRATIONS = (
+    ("model", "TEXT"),          # primary model of the run (cron sessions)
+    ("cost_usd", "REAL"),       # total cost of the run, all models and auxiliary tasks
+    ("tokens_in", "INTEGER"),   # input + cache read + cache write
+    ("tokens_out", "INTEGER"),  # output (reasoning included)
+)
+POST_MIGRATION = """
+CREATE INDEX IF NOT EXISTS idx_items_cost ON items(source, ts) WHERE cost_usd IS NOT NULL;
 """
 
 ITEM_FIELDS = (
@@ -89,6 +109,12 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=15000")
     conn.executescript(SCHEMA)
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
+    for name, ddl in MIGRATIONS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE items ADD COLUMN {name} {ddl}")
+    conn.executescript(POST_MIGRATION)
+    conn.commit()
     return conn
 
 
@@ -105,7 +131,10 @@ def set_meta(conn: sqlite3.Connection, key: str, value) -> None:
 
 
 def known_refs(conn: sqlite3.Connection, source: str) -> set[str]:
-    return {r[0] for r in conn.execute("SELECT source_ref FROM items WHERE source=?", (source,))}
+    """Refs already indexed, plus refs retention removed (so they are not re-added)."""
+    refs = {r[0] for r in conn.execute("SELECT source_ref FROM items WHERE source=?", (source,))}
+    refs.update(r[0] for r in conn.execute("SELECT source_ref FROM tombstones WHERE source=?", (source,)))
+    return refs
 
 
 def _normalize(item: dict) -> dict:

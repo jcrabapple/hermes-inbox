@@ -6,7 +6,7 @@
 
 **One inbox for everything your [Hermes Agent](https://github.com/NousResearch/hermes-agent) does.**
 
-Cron results, files the agent hands you in chat, kanban hand-offs and your own notes, in a fast mail-style web app that works just as well on your phone.
+Cron results, files the agent hands you in chat, kanban hand-offs and your own notes, in a fast mail-style web app that works just as well on your phone. It also shows what each scheduled job costs you.
 
 [![Tests](https://github.com/jcrabapple/hermes-inbox/actions/workflows/tests.yml/badge.svg)](https://github.com/jcrabapple/hermes-inbox/actions/workflows/tests.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
@@ -18,6 +18,7 @@ Cron results, files the agent hands you in chat, kanban hand-offs and your own n
 ![Desktop, dark theme](docs/screenshots/desktop-dark.png)
 
 <p align="center">
+  <img src="docs/screenshots/phone-usage-dark.png" alt="Usage page on a phone: cost per day and per job" width="260">
   <img src="docs/screenshots/phone-list-dark.png" alt="Phone inbox, dark theme" width="260">
   <img src="docs/screenshots/phone-item-dark.png" alt="Phone reading view with bottom actions" width="260">
   <img src="docs/screenshots/phone-list-light.png" alt="Phone, light theme" width="260">
@@ -55,6 +56,13 @@ Hermes databases are opened **read-only**. Nothing under your Hermes home is eve
   the first one is flagged.
 - **Rich previews.** Markdown rendered, images, PDFs, HTML (sandboxed), audio/video,
   text and code, with Open and Download.
+- **Model and cost per run.** Each scheduled run shows the model, tokens (in, cached, out,
+  reasoning), duration and cost, including auxiliary calls like compression, read from
+  Hermes' own session records. The **Usage** page totals cost per job, per model and per
+  day for 7, 30 or 90 days, and each job's view shows what it has cost so far.
+- **Retention and export.** Quiet runs are deleted after 30 days by default and starred
+  items never are. Both windows are configurable. Export any view as JSON or CSV from the
+  web app, the CLI or the API.
 - **Full-text search** (SQLite FTS5) over everything, including runs whose output files
   Hermes has since deleted.
 - **Phone-first UI.** Bottom tab bar, bottom action bar in the reader, swipe right to toggle
@@ -111,6 +119,8 @@ Everything is optional.
 | `HERMES_INBOX_CONFIG` | `$XDG_CONFIG_HOME/hermes-inbox` | Where the `token` file lives (mode 600) |
 | `HERMES_INBOX_TOKEN` | *(token file)* | Use this token instead of the file |
 | `HERMES_INBOX_INTERVAL` | `60` | Seconds between index passes |
+| `HERMES_INBOX_KEEP_QUIET_DAYS` | `30` | Delete quiet runs (skipped, silent, unchanged) older than this. `0` keeps them forever |
+| `HERMES_INBOX_KEEP_DAYS` | `0` | Delete every unstarred item older than this. `0` keeps them forever |
 
 ## Running it as a service
 
@@ -182,6 +192,9 @@ JSON body.
 | `POST` | `/api/notes` | Create a note |
 | `POST` | `/api/reindex` | Index now |
 | `GET` | `/api/jobs` | Cron jobs from every profile's `jobs.json` |
+| `GET` | `/api/usage?days=30` | Cost and tokens per job, model and day, plus storage and retention status (`days=0` for all time) |
+| `GET` | `/api/export?format=json\|csv&view=&source=&group=&q=` | Download items matching the same filters as `/api/items`. CSV leaves out bodies unless `body=1` |
+| `POST` | `/api/prune` | Apply the retention policy now (`{"dry_run": true}` to preview) |
 
 ## CLI
 
@@ -192,7 +205,21 @@ hermes-inbox post TITLE [-b BODY | -] [--level L] [--group NAME] [--link URL]
 hermes-inbox stats          item counts per source
 hermes-inbox retitle        recompute run subjects after changing the subject rules
 hermes-inbox token [--show] where the login token lives, or the token itself
+hermes-inbox usage [--days 30]                       cost and models per scheduled job
+hermes-inbox prune [--dry-run] [--quiet-days N] [--keep-days N]
+hermes-inbox export [--format json|csv] [--view all] [--source cron] [--group JOB] [--since 30d] [-o FILE]
 ```
+
+## Cost data: what to expect
+
+![Usage page: cost per day, per job and per model](docs/screenshots/desktop-usage-dark.png)
+
+Hermes records token counts and an estimated cost (or the provider's actual bill, when it
+reports one) on each cron session, and prunes cron sessions after about a week. Hermes
+Inbox matches each run to its session as soon as the run lands and keeps the numbers, so
+**costs build up from the day you install it**. Runs that were already older than
+Hermes' session retention show as having no cost data. Script-only jobs and runs skipped
+by a script gate never call a model, so they have no cost.
 
 ## Security
 
@@ -208,14 +235,16 @@ hermes-inbox token [--show] where the login token lives, or the token itself
 - **CSRF.** Cookie-authenticated writes must be `application/json`, which a cross-site form
   can't send without a preflight.
 - **Storage.** The inbox database and token file are created owner-only (600, in 700
-  directories).
+  directories). Exports are only available to an authenticated session and are
+  served as downloads, never cached. CSV cells that start with `=`, `+`, `-` or `@` are
+  prefixed with `'` so spreadsheets don't run them as formulas.
 
 ## How it works
 
 ```
 ~/.hermes ──read-only──▶ indexer (every 60s, per-source cursors)
   cron/output/*/*.md            │
-  state.db  (MEDIA: lines)      ▼
+  state.db  (MEDIA:, costs)     ▼
   kanban/**/kanban.db     inbox.db (SQLite + FTS5, read/star/archive state)
                                 │
                                 ▼
@@ -228,7 +257,10 @@ hermes_inbox/
   server.py     HTTP server, auth, JSON API, file serving
   indexer.py    incremental indexing with per-source cursors
   sources.py    readers for cron output, state.db and kanban
-  store.py      schema, FTS5, upserts
+  usage.py      matches cron runs to Hermes sessions for model, tokens and cost
+  retention.py  pruning policy and storage stats
+  export.py     JSON and CSV export
+  store.py      schema, migrations, FTS5, upserts
   static/       the web app (HTML, CSS, JS, icons, vendored libraries)
 tools/
   contrast.py   WCAG contrast check for both themes
