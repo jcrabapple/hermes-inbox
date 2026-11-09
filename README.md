@@ -41,6 +41,7 @@ place, keeps its own copy, and lets you triage it like email: read, star, archiv
 | **Scheduled runs** | `cron/output/<job>/*.md` in your Hermes home and every profile | run |
 | **Artifacts** | `MEDIA:<path>` and `::preview{file=…}` in assistant messages (`state.db`, every profile), kanban artifacts and task attachments | file (re-shares merge; an edited file comes back unread) |
 | **Kanban** | finished `task_runs` across `kanban.db` and `kanban/boards/*/kanban.db` | worker run |
+| **Job health** | `cron/jobs.json` in every profile: `next_run_at`, `failure_streak`, `last_error` | broken job, not broken run |
 | **Notes** | `hermes-inbox post …` or `POST /api/notes` from any script | note |
 
 Hermes databases are opened **read-only**. Nothing under your Hermes home is ever written.
@@ -52,6 +53,17 @@ Hermes databases are opened **read-only**. Nothing under your Hermes home is eve
   still visible inside each job.
 - **What changed since the last run.** Every run can show a line diff against the previous
   run of the same job, so a monitoring report that grew one line shows you that line.
+- **Job health.** The inbox only sees runs that wrote a file, so a job that stopped firing
+  is invisible. Job health reads `jobs.json` and opens one item per broken job: overdue
+  (`next_run_at` an hour past, or three intervals for fast jobs), or two or more failures
+  in a row. The item keeps its original start time instead of piling up a copy per index
+  pass, and it archives itself with a "Resolved" note when the job recovers, is disabled,
+  or is deleted. For jobs with no recorded run, this is the only way the inbox learns they
+  exist.
+- **Snooze.** Postpone an item for an hour, until tomorrow morning or a week, and it leaves
+  every view until then (there is a Snoozed view, and items come back on their own). Unlike
+  archive, a snooze changes nothing about the item; unlike read, it does not pretend you
+  looked at it.
 - **Every profile, one inbox.** Cron jobs, artifacts and state from all Hermes profiles
   (`~/.hermes/profiles/*`) are indexed alongside the default home and tagged with the
   profile name. Once a second profile has cron activity, a filter row appears at the top
@@ -193,10 +205,10 @@ JSON body.
 | Method | Path | |
 |---|---|---|
 | `GET` | `/api/summary` | Counts per view, source and job; last index pass |
-| `GET` | `/api/items?view=&source=&group=&profile=&q=&ftype=&noise=1&before=` | Paged list. `view`: `inbox`, `attention`, `starred`, `all`, `archive` |
+| `GET` | `/api/items?view=&source=&group=&profile=&q=&ftype=&noise=1&before=` | Paged list. `view`: `inbox`, `attention`, `starred`, `snoozed`, `all`, `archive` |
 | `GET` | `/api/items/<id>` | One item with its full body |
 | `GET` | `/api/items/<id>/file[?download=1]` | An artifact's file (only paths the agent published) |
-| `POST` | `/api/items/<id>` | `{"read": bool, "starred": bool, "archived": bool}` |
+| `POST` | `/api/items/<id>` | `{"read": bool, "starred": bool, "archived": bool, "snoozed_until": epoch}`. `snoozed_until: null` brings it back; a past time is rejected |
 | `POST` | `/api/bulk` | `{"action": "read"\|"unread"\|"archive"\|"unarchive", "ids": [...] \| "filter": {...}}` |
 | `POST` | `/api/notes` | Create a note |
 | `POST` | `/api/reindex` | Index now |
@@ -254,8 +266,9 @@ by a script gate never call a model, so they have no cost.
 ```
 ~/.hermes ──read-only──▶ indexer (every 60s, per-source cursors)
   cron/output/*/*.md            │
+  cron/jobs.json (health)       │
   state.db  (MEDIA:, costs)     ▼
-  kanban/**/kanban.db     inbox.db (SQLite + FTS5, read/star/archive state)
+  kanban/**/kanban.db     inbox.db (SQLite + FTS5, read/star/archive/snooze state)
                                 │
                                 ▼
                      stdlib HTTP server ──▶ single-page app (vanilla JS)
@@ -266,7 +279,7 @@ hermes_inbox/
   cli.py        CLI entry point
   server.py     HTTP server, auth, JSON API, file serving
   indexer.py    incremental indexing with per-source cursors
-  sources.py    readers for cron output, state.db and kanban
+  sources.py    readers for cron output, jobs.json, state.db and kanban
   usage.py      matches cron runs to Hermes sessions for model, tokens and cost
   retention.py  pruning policy and storage stats
   export.py     JSON and CSV export

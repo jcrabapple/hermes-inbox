@@ -76,12 +76,13 @@ class Indexer:
         if store.get_meta(self.conn, "backfill_cutoff") is None:
             store.set_meta(self.conn, "backfill_cutoff", started - BACKFILL_UNREAD_WINDOW)
             self.conn.commit()
-        counts = {"cron": 0, "artifact": 0, "kanban": 0}
+        counts = {"cron": 0, "artifact": 0, "kanban": 0, "scheduler": 0}
         priced = 0
         for profile, home in sources.hermes_homes(self.root):
             counts["cron"] += self._index_cron(profile, home)
             counts["artifact"] += self._index_artifacts(profile, home)
             counts["kanban"] += self._index_kanban(profile, home)
+            counts["scheduler"] += self._index_scheduler(profile, home)
             priced += self._index_usage(profile, home)
         store.set_meta(self.conn, "last_index", {"at": time.time(), "took": round(time.time() - started, 2),
                                                  "new": counts, "priced": priced})
@@ -117,6 +118,39 @@ class Indexer:
                 if store.insert_item(self.conn, item, read=self._initial_read(item["ts"])):
                     added += 1
             self.conn.commit()
+        return added
+
+    def _index_scheduler(self, profile: str, home: Path) -> int:
+        """One durable item per broken job, resolved when the job recovers.
+
+        The ref is stable per (job, problem), so a job failing for two days stays one
+        item instead of one per index pass, and the incident keeps its original start
+        time instead of jumping to the top of the list every minute.
+        """
+        incidents = sources.scheduler_incidents(profile, sources.load_jobs(home))
+        existing = {r["source_ref"]: r for r in self.conn.execute(
+            "SELECT id, source_ref, ts, status FROM items WHERE source='scheduler' AND profile=?",
+            (profile,))}
+        added, seen = 0, set()
+        for item in incidents:
+            seen.add(item["source_ref"])
+            old = existing.get(item["source_ref"])
+            reopened = bool(old and old["status"] == "resolved")
+            if old and not reopened:
+                item["ts"] = old["ts"]  # ongoing incident: keep when it started
+            if old is None or reopened:
+                added += 1
+            store.upsert_item(self.conn, item, read=self._initial_read(item["ts"]), reopen=reopened)
+        for ref, old in existing.items():
+            if ref in seen or old["status"] == "resolved":
+                continue
+            self.conn.execute(
+                "UPDATE items SET status='resolved', attention=0, archived=1, "
+                "summary='No longer a problem: the job recovered, was disabled, or was removed.', "
+                "body=body || ? WHERE id=?",
+                (f"\n\n---\n\n**Resolved** {time.strftime('%a %d %b %H:%M')}: this job no longer reports "
+                 f"this problem.", old["id"]))
+        self.conn.commit()
         return added
 
     def retitle_cron(self) -> int:

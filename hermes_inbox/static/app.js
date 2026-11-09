@@ -10,6 +10,7 @@ const isNarrow = () => narrowMQ.matches;
 
 const SOURCE_META = {
   cron: { label: 'Scheduled runs', icon: 'clock' },
+  scheduler: { label: 'Job health', icon: 'alert' },
   artifact: { label: 'Artifacts', icon: 'file' },
   kanban: { label: 'Kanban', icon: 'board' },
   note: { label: 'Notes', icon: 'note' },
@@ -18,6 +19,7 @@ const VIEWS = [
   { id: 'inbox', label: 'Inbox', icon: 'inbox', badge: 'inbox' },
   { id: 'attention', label: 'Needs attention', icon: 'alert', badge: 'attention', hot: true },
   { id: 'starred', label: 'Starred', icon: 'star' },
+  { id: 'snoozed', label: 'Snoozed', icon: 'clock', badge: 'snoozed' },
   { id: 'all', label: 'Everything', icon: 'layers' },
   { id: 'archive', label: 'Archive', icon: 'archive' },
 ];
@@ -27,6 +29,7 @@ const STATUS_TAG = {
   crashed: ['', 'Crashed'], timed_out: ['', 'Timed out'], review_requested: ['accent', 'Review requested'],
   skipped: ['', 'Skipped'], silent: ['', 'Silent'], unchanged: ['', 'Same as last run'], empty: ['', 'No output'],
   missing: ['', 'File gone'], completed: ['ok', 'Completed'], attention: ['warn', 'Attention'], warning: ['warn', 'Warning'], error: ['warn', 'Error'],
+  overdue: ['', 'Overdue'], failing: ['', 'Failing'], resolved: ['ok', 'Resolved'],
 };
 
 const state = {
@@ -190,13 +193,25 @@ function renderNav() {
   $('#index-status').textContent = li ? `Checked ${ago(li.at)}` : 'Indexing…';
   document.title = s.views.inbox ? `(${s.views.inbox}) Hermes Inbox` : 'Hermes Inbox';
 
-  const tab = onPage ? 'more' : r.group ? '' : r.source === 'artifact' ? 'artifact' : r.source ? '' : r.view;
+  const tab = onPage || r.view === 'snoozed' ? 'more' : r.group ? '' : r.source === 'artifact' ? 'artifact' : r.source ? '' : r.view;
   $$('.tab[data-tab]').forEach((t) => t.setAttribute('aria-current', String(t.dataset.tab === tab)));
   $('[data-badge="inbox"]').textContent = s.views.inbox > 99 ? '99+' : s.views.inbox || '';
   $('[data-badge="attention"]').textContent = s.views.attention || '';
 }
+let snoozeTimer;
+function scheduleSnoozeRefresh() {
+  // Snoozed items come back on their own; refresh when the earliest one is due.
+  clearTimeout(snoozeTimer);
+  const due = state.summary?.next_snooze;
+  if (!due) return;
+  const ms = Math.max(1000, due * 1000 - Date.now() + 1000);
+  snoozeTimer = setTimeout(async () => {
+    await loadSummary();
+    if (!state.q) { await loadList(true); markSelected(); }
+  }, Math.min(ms, 2147483000));
+}
 async function loadSummary() {
-  try { state.summary = await api('/api/summary'); renderNav(); } catch (e) { console.warn(e); }
+  try { state.summary = await api('/api/summary'); renderNav(); scheduleSnoozeRefresh(); } catch (e) { console.warn(e); }
 }
 function openDrawer() { $('#app').classList.add('nav-open'); $('#btn-drawer-close').focus({ preventScroll: true }); }
 function closeDrawer() { $('#app').classList.remove('nav-open'); }
@@ -274,12 +289,21 @@ function typeLabel(mime, name) {
   if (mime.startsWith('video/')) return 'Video';
   return ext.length <= 5 ? ext : 'File';
 }
+function snoozeText(ts) {
+  const d = new Date(ts * 1000);
+  const sameDay = dayKey(ts) === dayKey(Date.now() / 1000);
+  return d.toLocaleString(undefined, sameDay ? { hour: 'numeric', minute: '2-digit' }
+    : { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+}
+function isSnoozed(it) { return !!it.snoozed_until && it.snoozed_until * 1000 > Date.now(); }
+function isoTs(s) { const t = Date.parse(s); return Number.isFinite(t) ? t / 1000 : null; }
 function rowHtml(it) {
   const src = SOURCE_META[it.source] || { icon: 'note' };
   const tags = [];
   if (it.attention) tags.push(`<span class="tag warn">${icon('alert')}Needs attention</span>`);
   const st = STATUS_TAG[it.status];
   if (st && !(it.attention && st[0] === 'warn')) tags.push(`<span class="tag ${st[0]}">${st[1]}</span>`);
+  if (isSnoozed(it)) tags.push(`<span class="tag">${icon('clock')}Snoozed until ${esc(snoozeText(it.snoozed_until))}</span>`);
   if (it.source === 'artifact' && it.extra.mime) tags.push(`<span class="tag">${esc(typeLabel(it.extra.mime, it.title))}</span>`);
   if (it.profile && it.profile !== 'default') tags.push(`<span class="tag accent">${esc(it.profile)}</span>`);
   const cls = ['row', it.read ? '' : 'unread', it.noise ? 'noise' : ''].join(' ');
@@ -311,6 +335,7 @@ function renderList() {
       : r.view === 'inbox' ? ['Inbox zero', 'New cron results, chat artifacts and kanban updates land here.']
       : r.view === 'attention' ? ['Nothing needs you', 'Failed runs, blocked tasks and alerts show up here.']
       : r.view === 'starred' ? ['No starred items', 'Star anything you want to keep handy.']
+      : r.view === 'snoozed' ? ['Nothing snoozed', 'Snooze an item to keep it out of the inbox until you want it.']
       : ['Nothing here yet', ''];
     el.innerHTML = `<div class="list-msg"><strong>${msg[0]}</strong>${msg[1]}</div>`;
     return;
@@ -375,9 +400,20 @@ function barButton(act, iconName, label, extra = '', cls = '') {
 function itemBar(it) {
   const idx = state.items.findIndex((x) => x.id === it.id);
   const hasNewer = idx > 0; const hasOlder = idx >= 0 && (idx < state.items.length - 1 || !!state.next);
+  const snz = isSnoozed(it);
   return `<div class="item-bar" role="toolbar" aria-label="Item actions">
     ${barButton('back', 'back', 'Back', '', 'only-narrow')}
     ${barButton('star', 'star', it.starred ? 'Starred (s)' : 'Star (s)', `aria-pressed="${!!it.starred}"`)}
+    <span class="snooze-wrap">
+      ${barButton('snooze', 'clock', snz ? `Snoozed until ${snoozeText(it.snoozed_until)}` : 'Snooze (b)',
+        `aria-pressed="${snz}" aria-haspopup="true" aria-expanded="false"`)}
+      <div class="menu snooze-menu" role="menu" hidden>
+        <button type="button" role="menuitem" data-snooze="1h">In 1 hour</button>
+        <button type="button" role="menuitem" data-snooze="tomorrow">Tomorrow 9am</button>
+        <button type="button" role="menuitem" data-snooze="week">In a week</button>
+        ${snz ? '<button type="button" role="menuitem" data-snooze="clear">Bring back now</button>' : ''}
+      </div>
+    </span>
     ${barButton('unread', 'mail', it.read ? 'Unread (u)' : 'Read (u)')}
     ${barButton('archive', it.archived ? 'inbox' : 'archive', it.archived ? 'To inbox (e)' : 'Archive (e)')}
     <span class="bar-sep"></span>
@@ -434,11 +470,27 @@ function renderItem(it) {
       ['Board', esc(it.group_label)], ['Task', `<code>${esc(x.task_id)}</code>`], ['Worker', esc(x.profile)],
       ['Task status now', esc(x.task_status)], ['Run', `#${esc(x.run_id)}`], ['Ended', esc(fullTime(it.ts))],
     ]);
+  } else if (it.source === 'scheduler') {
+    const jobLink = routeHash({ view: 'all', source: 'cron', group: it.group_key, profile: it.profile !== 'default' ? it.profile : '' });
+    body += `<div class="md">${md(it.body)}</div>` + '<div class="section-title">Job</div>' + factRows([
+      ['Job', `<a href="${jobLink}">${esc(it.group_label)}</a> <code class="muted">${esc(x.job_id)}</code>`],
+      ['Since', esc(fullTime(it.ts))],
+      ['Schedule', x.schedule ? `<code>${esc(x.schedule)}</code>` : ''],
+      ['Last run', isoTs(x.last_run_at) ? `${esc(fullTime(isoTs(x.last_run_at)))} <span class="tag">${esc(x.last_status || 'unknown')}</span>` : ''],
+      ['Failures in a row', x.failure_streak ? String(x.failure_streak) : ''],
+      ['Delivery', typeof x.deliver === 'string' ? esc(x.deliver) : ''],
+      ['Checked', x.checked_at ? esc(fullTime(x.checked_at)) : ''],
+      ['Runs', `<a href="${jobLink}">Open this job's runs</a>`],
+    ]);
   } else {
     body += `<div class="md">${md(it.body)}</div>`;
     if (x.link && /^https?:\/\//.test(x.link)) body += `<p><a class="btn" href="${esc(x.link)}" target="_blank" rel="noopener noreferrer">${icon('external')}Open link</a></p>`;
   }
 
+  if (isSnoozed(it)) {
+    body = `<div class="notice soft">Snoozed until ${esc(fullTime(it.snoozed_until))}. ` +
+      `Use Snooze → Bring back now to return it to the inbox early.</div>` + body;
+  }
   el.innerHTML = `${itemBar(it)}
     <h1 class="${it.source === 'artifact' ? 'filename' : ''}">${esc(it.title || it.group_label)}</h1>
     <div class="meta">
@@ -682,10 +734,58 @@ async function archive(it, { fromReader = false } = {}) {
     else openItem(next.id);
   }
 }
+function snoozeTarget(kind) {
+  const now = Date.now();
+  if (kind === '1h') return now + 3600e3;
+  if (kind === 'week') return now + 7 * 86400e3;
+  const d = new Date(now); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0);
+  return d.getTime();
+}
+function toggleSnoozeMenu(open) {
+  const menu = $('.snooze-menu'); if (!menu) return;
+  const show = open ?? menu.hidden;
+  menu.hidden = !show;
+  const btn = $('.item-bar [data-act="snooze"]');
+  if (btn) btn.setAttribute('aria-expanded', String(show));
+  if (show) menu.querySelector('button')?.focus({ preventScroll: true });
+}
+async function setSnooze(it, untilMs, { fromReader = false } = {}) {
+  const until = untilMs ? untilMs / 1000 : null;
+  const prev = isSnoozed(it) ? it.snoozed_until : null;
+  // Snoozing hides an item from the inbox; unsnoozing hides it from the Snoozed view.
+  const leaving = until ? !['all', 'snoozed'].includes(state.route.view) : state.route.view === 'snoozed';
+  const next = neighbour(it.id, 1) || neighbour(it.id, -1);
+  const put = (val) => {
+    it.snoozed_until = val;
+    const li = state.items.find((x) => x.id === it.id);
+    if (li) { li.snoozed_until = val; updateRow(li); }
+  };
+  let removed = null;
+  if (leaving) removed = removeFromList(it.id); else put(until);
+  try { await post(`/api/items/${it.id}`, { snoozed_until: until }); } catch (e) {
+    if (removed) restoreToList(removed); else put(prev);
+    toast(`Couldn't save: ${e.message}`); return;
+  }
+  loadSummary();
+  toast(until ? `Snoozed until ${snoozeText(until)}` : 'Back in the inbox', {
+    label: 'Undo',
+    run: async () => {
+      await post(`/api/items/${it.id}`, { snoozed_until: prev });
+      if (removed) { restoreToList(removed); put(prev); } else put(prev);
+      markSelected(); loadSummary();
+    },
+  });
+  if (fromReader) {
+    if (!removed) { renderItem(it); return; }
+    if (isNarrow() || !next) location.hash = routeHash(state.route);
+    else openItem(next.id);
+  }
+}
 async function act(name) {
   if (name === 'back') { history.length > 1 && location.hash.includes('/item/') ? history.back() : (location.hash = routeHash(state.route)); return; }
   const it = current(); if (!it) return;
   if (name === 'star') { await setFlag(it, 'starred', !it.starred); renderItem(it); }
+  else if (name === 'snooze') toggleSnoozeMenu();
   else if (name === 'unread') {
     await setFlag(it, 'read', !it.read);
     if (!it.read && isNarrow()) location.hash = routeHash(state.route); else renderItem(it);
@@ -777,7 +877,15 @@ $('#list').addEventListener('click', (e) => {
   if (e.target.closest('#btn-more')) { loadList(false); return; }
   const row = e.target.closest('.row'); if (row) openItem(Number(row.dataset.id));
 });
-$('#item').addEventListener('click', (e) => { const b = e.target.closest('[data-act]'); if (b && !b.disabled) act(b.dataset.act); });
+$('#item').addEventListener('click', (e) => {
+  const s = e.target.closest('[data-snooze]');
+  if (s) {
+    const it = current();
+    if (it) setSnooze(it, s.dataset.snooze === 'clear' ? null : snoozeTarget(s.dataset.snooze), { fromReader: true });
+    return;
+  }
+  const b = e.target.closest('[data-act]'); if (b && !b.disabled) act(b.dataset.act);
+});
 $('#filters').addEventListener('click', (e) => {
   const c = e.target.closest('.chip'); if (!c) return;
   if (c.hasAttribute('data-noise')) state.noise = !state.noise;
@@ -788,7 +896,10 @@ $('#filters').addEventListener('click', (e) => {
 $('#btn-markall').addEventListener('click', markAll);
 $('#btn-export').addEventListener('click', (e) => { e.stopPropagation(); toggleExportMenu(); });
 $('#export-menu').addEventListener('click', () => toggleExportMenu(false));
-document.addEventListener('click', (e) => { if (!e.target.closest('.menu-wrap')) toggleExportMenu(false); });
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.menu-wrap')) toggleExportMenu(false);
+  if (!e.target.closest('.snooze-wrap')) toggleSnoozeMenu(false);
+});
 $('#item').addEventListener('click', (e) => { if (e.target.closest('[data-page-back]')) location.hash = routeHash(state.route); });
 $('#jobs-toggle').addEventListener('click', () => { state.showAllJobs = !state.showAllJobs; renderNav(); });
 $('#btn-menu').addEventListener('click', openDrawer);
@@ -831,12 +942,14 @@ document.addEventListener('keydown', (e) => {
   const k = e.key;
   if (k === 'Escape' && $('#app').classList.contains('nav-open')) { closeDrawer(); return; }
   if (k === 'Escape' && !$('#export-menu').hidden) { toggleExportMenu(false); $('#btn-export').focus(); return; }
+  if (k === 'Escape' && $('.snooze-menu') && !$('.snooze-menu').hidden) { toggleSnoozeMenu(false); return; }
   if (state.page === 'usage') { if (k === 'Escape') location.hash = routeHash(state.route); return; }
   if (k === '/') { e.preventDefault(); $('#search').focus(); return; }
   if (k === 'j' || k === 'k') { e.preventDefault(); step(k === 'j' ? 1 : -1); return; }
   if (k === 'e' || k === '#') act('archive');
   else if (k === 's') act('star');
   else if (k === 'u') act('unread');
+  else if (k === 'b') act('snooze');
   else if (k === 'I' && e.shiftKey) markAll();
   else if (k === 'Escape') act('back');
   else if (k === 'g') { location.hash = '#/view/inbox'; }
@@ -856,6 +969,7 @@ async function pulse() {
     if (!res.changed) return;
     state.summary = res.summary;
     renderNav();
+    scheduleSnoozeRefresh();
     if (state.page === 'usage' || state.q) return;
     // Only refresh the list when it is visible and scrolled to the top, so nothing jumps under a finger.
     const listVisible = !isNarrow() || $('#app').dataset.pane === 'list';

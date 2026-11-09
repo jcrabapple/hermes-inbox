@@ -313,6 +313,15 @@ details.fold pre { margin: 6px 0 0; padding: 12px 14px; max-height: 60vh; overfl
 }
 .menu a { display: flex; align-items: center; min-height: 36px; padding: 0 12px; border-radius: 7px; color: var(--text); text-decoration: none; font-size: 13.5px; }
 .menu a:hover, .menu a:focus-visible { background: var(--hover); outline: none; }
+.menu button {
+  display: flex; align-items: center; width: 100%; min-height: 36px; padding: 0 12px; border: 0;
+  border-radius: 7px; background: none; color: var(--text); font: inherit; font-size: 13.5px;
+  text-align: left; cursor: pointer;
+}
+.menu button:hover, .menu button:focus-visible { background: var(--hover); outline: none; }
+.snooze-wrap { position: relative; display: inline-flex; }
+.menu.snooze-menu { min-width: 196px; }
+.item .notice + .md { margin-top: 14px; }
 .group-usage { margin: -4px 0 0; font-size: 12.5px; color: var(--text-2); }
 
 /* usage page */
@@ -488,8 +497,10 @@ details.fold pre { margin: 6px 0 0; padding: 12px 14px; max-height: 60vh; overfl
     position: fixed; top: auto; left: 0; right: 0; bottom: 0; margin: 0; z-index: 20;
     height: calc(var(--tabbar-h) + var(--safe-bottom)); padding: 0 var(--safe-right) var(--safe-bottom) var(--safe-left);
     background: var(--panel); border-top: 1px solid var(--line);
-    display: grid; grid-template-columns: repeat(5, 1fr); gap: 0;
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 0;
   }
+  .item-bar .snooze-wrap { display: flex; height: 100%; }
+  .item-bar .snooze-menu { top: auto; bottom: calc(100% + 6px); left: 0; right: auto; }
   .item-bar .bar-sep { display: none; }
   .item-bar .icon-btn {
     width: 100%; height: 100%; border-radius: 0; display: flex; flex-direction: column; gap: 3px;
