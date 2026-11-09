@@ -2,7 +2,7 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 2.3.0 (2026-11-09)
 
 ### Added
 - **Job health, a fourth source.** The inbox only sees runs that wrote an output file, so
