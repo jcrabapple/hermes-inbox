@@ -41,7 +41,7 @@ place, keeps its own copy, and lets you triage it like email: read, star, archiv
 | **Scheduled runs** | `cron/output/<job>/*.md` in your Hermes home and every profile | run |
 | **Artifacts** | `MEDIA:<path>` and `::preview{file=…}` in assistant messages (`state.db`, every profile), kanban artifacts and task attachments | file (re-shares merge; an edited file comes back unread) |
 | **Kanban** | finished `task_runs` across `kanban.db` and `kanban/boards/*/kanban.db` | worker run |
-| **Job health** | `cron/jobs.json` in every profile: `next_run_at`, `failure_streak`, `last_error` | broken job, not broken run |
+| **Job health** | `cron/jobs.json` in every profile: `next_run_at`, `failure_streak`, `paused_at`, `paused_reason` | broken or paused job, not broken run |
 | **Delegations** | `async_delegations` in every profile's `state.db` | result that never reached its chat |
 | **Notes** | `hermes-inbox post …` or `POST /api/notes` from any script | note |
 
@@ -56,11 +56,13 @@ Hermes databases are opened **read-only**. Nothing under your Hermes home is eve
   run of the same job, so a monitoring report that grew one line shows you that line.
 - **Job health.** The inbox only sees runs that wrote a file, so a job that stopped firing
   is invisible. Job health reads `jobs.json` and opens one item per broken job: overdue
-  (`next_run_at` an hour past, or three intervals for fast jobs), or two or more failures
-  in a row. The item keeps its original start time instead of piling up a copy per index
-  pass, and it archives itself with a "Resolved" note when the job recovers, is disabled,
-  or is deleted. For jobs with no recorded run, this is the only way the inbox learns they
-  exist.
+  (`next_run_at` an hour past, or three intervals for fast jobs), two or more failures in a
+  row, or paused. A pause sets `enabled=False`, so it would otherwise look like a deliberate
+  disable: the pause reason becomes the subject and is flagged for attention, while a pause
+  with no reason stays quiet in the inbox. The item keeps its original start time instead of
+  piling up a copy per index pass, and archives itself with a "Resolved" note when the job
+  recovers, is resumed, disabled, or deleted. For jobs with no recorded run, this is the
+  only way the inbox learns they exist.
 - **Snooze.** Postpone an item for an hour, until tomorrow morning or a week, and it leaves
   every view until then (there is a Snoozed view, and items come back on their own). Unlike
   archive, a snooze changes nothing about the item; unlike read, it does not pretend you

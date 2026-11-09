@@ -160,7 +160,7 @@ class Indexer:
         incidents = sources.scheduler_incidents(profile, sources.load_jobs(home))
         return self._sync_incidents(
             "scheduler", profile, incidents,
-            "No longer a problem: the job recovered, was disabled, or was removed.")
+            "No longer a problem: the job is running again, was disabled, or was removed.")
 
     def _index_delegations(self, profile: str, home: Path) -> int:
         """Results that never reached their conversation.

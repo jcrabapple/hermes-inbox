@@ -176,6 +176,13 @@ def write_cron(home: Path):
                  "last_status": "error", "failure_streak": 3,
                  "last_error": "RuntimeError: restic snapshot not found for the last 24h",
                  "last_failure": {"at": (now - timedelta(hours=1, minutes=35)).isoformat()}})
+    jobs.append({"id": "e5f6a1b2c3d4", "name": "Feed watcher", "enabled": False, "state": "paused",
+                 "paused_at": (now - timedelta(hours=30)).isoformat(),
+                 "paused_reason": "waiting on the FeedEcho API key",
+                 "schedule": {"kind": "cron", "display": "0 8 * * *"},
+                 "next_run_at": (now - timedelta(hours=26)).isoformat(),
+                 "last_run_at": (now - timedelta(days=2)).isoformat(),
+                 "last_status": "error", "failure_streak": 2, "deliver": "local"})
     (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": jobs}, indent=2))
     for idx, hours, kind, resp in RUNS:
         jid, name, sched = JOBS[idx]

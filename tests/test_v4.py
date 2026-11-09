@@ -83,12 +83,15 @@ class SchedulerIncidentTests(unittest.TestCase):
         self.assertIn("HTTP 402", it["body"])
         self.assertAlmostEqual(it["ts"], now - 7200, delta=1)
 
-    def test_disabled_and_paused_jobs_are_ignored(self):
+    def test_disabled_jobs_are_ignored_but_paused_ones_are_reported(self):
         now = time.time()
-        jobs = {"a": job(enabled=False, failure_streak=9, next_run_at=iso(now - 5 * 3600)),
-                "b": job(paused_at=iso(now - 86400), failure_streak=9,
-                         next_run_at=iso(now - 5 * 3600))}
+        jobs = {"a": job(enabled=False, failure_streak=9, next_run_at=iso(now - 5 * 3600))}
         self.assertEqual(sources.scheduler_incidents("default", jobs, now), [])
+        # Pausing sets enabled=False, so it must not fall into the disabled branch.
+        jobs = {"b": job(paused_at=iso(now - 86400), failure_streak=9,
+                         next_run_at=iso(now - 5 * 3600))}
+        items = sources.scheduler_incidents("default", jobs, now)
+        self.assertEqual([i["status"] for i in items], ["paused"])
 
     def test_bad_timestamps_do_not_raise(self):
         self.assertIsNone(sources.parse_iso("not a date"))

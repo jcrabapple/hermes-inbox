@@ -379,13 +379,12 @@ def scheduler_incidents(profile: str, jobs: dict, now: float | None = None) -> l
     now = time.time() if now is None else now
     out: list[dict] = []
     for job_id, job in jobs.items():
-        if not job.get("enabled", True) or job.get("paused_at"):
-            continue  # a job nobody expects to run cannot be late or failing
         name = job.get("name") or job_id
         sched = job.get("schedule") or {}
         schedule = sched.get("display") or job.get("schedule_display") or ""
         last_run = parse_iso(job.get("last_run_at"))
         last_status = job.get("last_status") or ""
+        streak = int(job.get("failure_streak") or 0)
         extra = {
             "job_id": job_id,
             "schedule": schedule,
@@ -393,9 +392,44 @@ def scheduler_incidents(profile: str, jobs: dict, now: float | None = None) -> l
             "last_run_at": job.get("last_run_at"),
             "last_status": last_status or None,
             "next_run_at": job.get("next_run_at"),
-            "failure_streak": int(job.get("failure_streak") or 0),
+            "failure_streak": streak,
             "checked_at": now,
         }
+
+        # Pausing sets enabled=False, so it must be recognised before the disabled check.
+        if job.get("paused_at") or job.get("state") == "paused":
+            reason = str(job.get("paused_reason") or "").strip()
+            started = parse_iso(job.get("paused_at")) or now
+            out.append({
+                "source": "scheduler",
+                "source_ref": f"{profile}:{job_id}:paused",
+                "title": f"Paused: {reason[:140]}" if reason else "Paused with no reason",
+                "summary": f"Since {_when(started)}"
+                           + (f" · last run {_when(last_run)} ({last_status or 'unknown'})" if last_run
+                              else " · never run"),
+                "body": ("**This job is paused and will not run.**\n\n"
+                         + (f"Reason: {reason}\n\n" if reason
+                            else "No reason was recorded when it was paused.\n\n")
+                         + f"Paused {_when(started)}.\n\nSchedule: `{schedule or 'unknown'}`.\n\n"
+                         + (f"Last run: {_when(last_run)} ({last_status or 'unknown'}).\n\n" if last_run
+                            else "This job has never run.\n\n")
+                         + (f"It failed {streak} times before it was paused.\n\n" if streak else "")
+                         + "Resume it with `hermes cron resume <job>` once the reason no longer "
+                           "applies; this item clears itself when it runs again."),
+                "status": "paused",
+                "attention": bool(reason),
+                "noise": False,
+                "group_key": job_id,
+                "group_label": name,
+                "profile": profile,
+                "ts": started,
+                "extra": {**extra, "kind": "paused", "paused_at": job.get("paused_at"),
+                          "paused_reason": reason or None},
+            })
+            continue  # a paused job cannot be late or failing
+
+        if not job.get("enabled", True):
+            continue  # a job nobody expects to run cannot be late or failing
 
         nxt = parse_iso(job.get("next_run_at"))
         if nxt and now - nxt > overdue_grace(job):
@@ -423,7 +457,6 @@ def scheduler_incidents(profile: str, jobs: dict, now: float | None = None) -> l
                 "extra": {**extra, "kind": "overdue", "late_by": round(late)},
             })
 
-        streak = int(job.get("failure_streak") or 0)
         if streak >= STREAK_ALERT:
             started = parse_iso(job.get("last_failure")) or last_run or now
             err = job.get("last_error") or ""

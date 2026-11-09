@@ -2,6 +2,22 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
+## 2.5.0 (2026-11-09)
+
+### Added
+- **Paused jobs, the third job-health incident.** `hermes cron pause` writes
+  `enabled=False, state='paused', paused_at, paused_reason`, so a paused job used to look
+  exactly like one deliberately disabled and never appeared anywhere. Job health now opens
+  one item per paused job: the reason is the subject ("Paused: waiting on the API key") and
+  the item is flagged for attention, while a pause with no recorded reason still appears in
+  the inbox but stays out of Needs attention. The body shows when it was paused, the
+  schedule, the last run and status, and any failure streak from before the pause. Resuming
+  the job resolves and archives the item; pausing it again reopens it unread.
+- Paused jobs are excluded from the overdue and failing checks: a job that will not run
+  cannot be late, and its old failure streak is history rather than a live problem.
+- Demo fixture gains one paused job; `tests/test_v6.py` covers the reader and index
+  lifecycle (71 tests total).
+
 ## 2.4.0 (2026-11-09)
 
 ### Added

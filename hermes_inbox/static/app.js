@@ -31,7 +31,7 @@ const STATUS_TAG = {
   skipped: ['', 'Skipped'], silent: ['', 'Silent'], unchanged: ['', 'Same as last run'], empty: ['', 'No output'],
   missing: ['', 'File gone'], completed: ['ok', 'Completed'], attention: ['warn', 'Attention'], warning: ['warn', 'Warning'], error: ['warn', 'Error'],
   overdue: ['', 'Overdue'], failing: ['', 'Failing'], resolved: ['ok', 'Resolved'],
-  undelivered: ['', 'Not delivered'],
+  undelivered: ['', 'Not delivered'], paused: ['', 'Paused'],
 };
 
 const state = {
@@ -490,6 +490,8 @@ function renderItem(it) {
     const jobLink = routeHash({ view: 'all', source: 'cron', group: it.group_key, profile: it.profile !== 'default' ? it.profile : '' });
     body += `<div class="md">${md(it.body)}</div>` + '<div class="section-title">Job</div>' + factRows([
       ['Job', `<a href="${jobLink}">${esc(it.group_label)}</a> <code class="muted">${esc(x.job_id)}</code>`],
+      ['Problem', esc(it.status)],
+      ['Reason', x.paused_reason ? esc(x.paused_reason) : ''],
       ['Since', esc(fullTime(it.ts))],
       ['Schedule', x.schedule ? `<code>${esc(x.schedule)}</code>` : ''],
       ['Last run', isoTs(x.last_run_at) ? `${esc(fullTime(isoTs(x.last_run_at)))} <span class="tag">${esc(x.last_status || 'unknown')}</span>` : ''],
