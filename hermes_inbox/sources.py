@@ -452,6 +452,145 @@ def scheduler_incidents(profile: str, jobs: dict, now: float | None = None) -> l
     return out
 
 
+# ── delegations ─────────────────────────────────────────────────────────
+# A delegation that finished but whose result never reached its conversation is lost
+# work: the child ran, its answer is sitting in state.db, and nobody saw it.
+
+# Still might land on its own, so they are not "finished" yet.
+LIVE_DELEGATION_STATES = ("running", "finalizing", "stalling")
+# Give the normal delivery path a few minutes before calling a pending result lost.
+DELIVERY_GRACE = 600
+
+
+def _json_list(raw, key: str) -> list:
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        return []
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, list) else []
+
+
+def _goals(task_json) -> str:
+    try:
+        task = json.loads(task_json or "{}")
+    except ValueError:
+        return ""
+    if not isinstance(task, dict):
+        return ""
+    goals = task.get("goals")
+    if isinstance(goals, list) and goals:
+        return "\n".join(f"- {g}" for g in goals if g)[:2000]
+    return str(task.get("goal") or "")[:2000]
+
+
+def _summaries(result_json, limit: int = 3) -> list[str]:
+    out = []
+    for r in _json_list(result_json, "results")[:limit]:
+        if isinstance(r, dict) and r.get("summary"):
+            out.append(str(r["summary"]))
+    return out
+
+
+def _transcripts(result_json) -> list[str]:
+    try:
+        data = json.loads(result_json or "{}")
+    except ValueError:
+        return []
+    paths = data.get("live_transcripts") if isinstance(data, dict) else None
+    return [str(p) for p in paths][:5] if isinstance(paths, list) else []
+
+
+def delegation_incidents(profile: str, home: Path, now: float | None = None) -> list[dict] | None:
+    """Undelivered delegation results. None when state.db is absent.
+
+    Raises sqlite3.Error when it exists but cannot be read, so the caller can
+    distinguish "nothing to report" from "could not look".
+    """
+    db = home / "state.db"
+    if not db.exists():
+        return None
+    now = time.time() if now is None else now
+    live = ",".join("?" for _ in LIVE_DELEGATION_STATES)
+    conn = ro_connect(db)
+    try:
+        try:
+            rows = conn.execute(
+                f"""SELECT delegation_id, state, dispatched_at, completed_at, updated_at,
+                           delivery_state, delivery_attempts, task_json, result_json, origin_session
+                    FROM async_delegations
+                    WHERE state NOT IN ({live})
+                      AND delivered_at IS NULL
+                      AND COALESCE(delivery_state, 'pending') != 'delivered'
+                    ORDER BY COALESCE(completed_at, dispatched_at) DESC""",
+                LIVE_DELEGATION_STATES,
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return None  # delegation was never used on this profile
+            raise
+        session_ids = sorted({r["origin_session"] for r in rows if r["origin_session"]})
+        titles: dict[str, str] = {}
+        if session_ids:
+            try:
+                found = conn.execute(
+                    f"SELECT id, title FROM sessions WHERE id IN ({','.join('?' * len(session_ids))})",
+                    session_ids).fetchall()
+                titles = {r["id"]: r["title"] for r in found if r["title"]}
+            except sqlite3.Error:
+                pass  # titles are decoration; the item stands without one
+    finally:
+        conn.close()
+
+    out: list[dict] = []
+    for r in rows:
+        dropped = r["delivery_state"] == "dropped"
+        finished = r["completed_at"] or r["updated_at"] or r["dispatched_at"]
+        if not dropped and finished and now - finished < DELIVERY_GRACE:
+            continue  # the normal delivery path is probably still working
+        attempts = int(r["delivery_attempts"] or 0)
+        goal = _goals(r["task_json"])
+        summaries = _summaries(r["result_json"])
+        session_title = titles.get(r["origin_session"] or "")
+        extra = {
+            "delegation_id": r["delegation_id"],
+            "state": r["state"],
+            "delivery_state": r["delivery_state"],
+            "attempts": attempts,
+            "dispatched_at": r["dispatched_at"],
+            "completed_at": r["completed_at"],
+            "origin_session": r["origin_session"],
+            "goal": goal[:2000] or None,
+            "transcripts": _transcripts(r["result_json"]),
+        }
+        body = ""
+        if goal:
+            body += f"**Goal**\n\n{goal}\n\n"
+        if summaries:
+            body += "**What came back**\n\n" + "\n\n".join(
+                f"> {s.strip()[:3000]}" for s in summaries) + "\n\n"
+        body += ("The child finished and its output is still in `state.db`, but the result never "
+                 "reached the conversation it was requested from. Re-run the work only if you still "
+                 "need it; the summary above is usually enough.")
+        out.append({
+            "source": "delegation",
+            "source_ref": f"{profile}:{r['delegation_id']}",
+            "title": (f"Result dropped after {attempts} delivery attempt{'s' if attempts != 1 else ''}"
+                      if dropped else "Result not delivered"),
+            "summary": (goal.splitlines()[0].lstrip("- ")[:240] if goal else f"Delegation {r['delegation_id']}"),
+            "body": body[:BODY_CAP],
+            "status": "undelivered",
+            "attention": True,
+            "noise": False,
+            "group_key": r["delegation_id"],
+            "group_label": session_title or "Delegations",
+            "profile": profile,
+            "ts": finished or now,
+            "extra": {**extra, "kind": "dropped" if dropped else "pending"},
+        })
+    return out
+
+
 # ── chat artifacts ───────────────────────────────────────────────────────
 
 def extract_paths(content: str, cwd: str | None) -> list[str]:

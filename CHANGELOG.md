@@ -2,6 +2,26 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
+## 2.4.0 (2026-11-09)
+
+### Added
+- **Lost delegation results, a fifth source.** Async delegations can finish and still have
+  their result never reach the conversation that asked for them. `async_delegations` in
+  every profile's `state.db` is now read for terminal delegations whose result was dropped
+  after failed deliveries, or that are still pending ten minutes after the child exited.
+  The item carries the goal and the child's own summary, so the answer is readable without
+  re-running the work, plus delivery attempts, the origin session and transcript paths.
+  Items resolve and archive themselves when delivery lands or the record is pruned, and a
+  later loss reopens them unread. An absent `state.db` or a missing table means the profile
+  never delegated; an unreadable one is skipped without resolving anything, so a transient
+  lock cannot tidy away a real loss.
+- Undelivered results are exempt from the 48-hour first-index backfill: a lost result is a
+  discrete failure, not the routine volume that rule exists to absorb, so an old one still
+  starts unread.
+- `_index_scheduler` and the new source share one `_sync_incidents` upsert/resolve path.
+- The demo fixture gains one dropped delegation, and `tests/test_v5.py` covers the reader
+  and the index lifecycle (63 tests total).
+
 ## 2.3.0 (2026-11-09)
 
 ### Added

@@ -42,6 +42,7 @@ place, keeps its own copy, and lets you triage it like email: read, star, archiv
 | **Artifacts** | `MEDIA:<path>` and `::preview{file=…}` in assistant messages (`state.db`, every profile), kanban artifacts and task attachments | file (re-shares merge; an edited file comes back unread) |
 | **Kanban** | finished `task_runs` across `kanban.db` and `kanban/boards/*/kanban.db` | worker run |
 | **Job health** | `cron/jobs.json` in every profile: `next_run_at`, `failure_streak`, `last_error` | broken job, not broken run |
+| **Delegations** | `async_delegations` in every profile's `state.db` | result that never reached its chat |
 | **Notes** | `hermes-inbox post …` or `POST /api/notes` from any script | note |
 
 Hermes databases are opened **read-only**. Nothing under your Hermes home is ever written.
@@ -64,6 +65,14 @@ Hermes databases are opened **read-only**. Nothing under your Hermes home is eve
   every view until then (there is a Snoozed view, and items come back on their own). Unlike
   archive, a snooze changes nothing about the item; unlike read, it does not pretend you
   looked at it.
+- **Lost delegation results.** An async delegation can finish and still have its result
+  never reach the conversation that asked for it, either because delivery was dropped after
+  repeated attempts or because it is still pending long after the child exited. Those items
+  carry the goal and the child's own summary, so the answer is readable without re-running
+  the work. They resolve and archive themselves if delivery lands later, and an unreadable
+  `state.db` never resolves one: a transient lock must not tidy away a real loss. Unlike
+  every other source, an old undelivered result is not filed as read on first index, since
+  the 48-hour backfill rule exists to absorb routine volume, not discrete failures.
 - **Every profile, one inbox.** Cron jobs, artifacts and state from all Hermes profiles
   (`~/.hermes/profiles/*`) are indexed alongside the default home and tagged with the
   profile name. Once a second profile has cron activity, a filter row appears at the top
@@ -266,9 +275,11 @@ by a script gate never call a model, so they have no cost.
 ```
 ~/.hermes ──read-only──▶ indexer (every 60s, per-source cursors)
   cron/output/*/*.md            │
-  cron/jobs.json (health)       │
-  state.db  (MEDIA:, costs)     ▼
-  kanban/**/kanban.db     inbox.db (SQLite + FTS5, read/star/archive/snooze state)
+  cron/jobs.json (job health)   │
+  state.db (files, cost, delegations)
+  kanban/**/kanban.db           │
+                                ▼
+                     inbox.db (SQLite + FTS5, read/star/archive/snooze state)
                                 │
                                 ▼
                      stdlib HTTP server ──▶ single-page app (vanilla JS)

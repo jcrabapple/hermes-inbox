@@ -265,12 +265,40 @@ def write_kanban(home: Path):
     conn.close()
 
 
+def write_delegations(home: Path):
+    """One delegation whose result never made it back to its conversation."""
+    conn = sqlite3.connect(home / "state.db")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS async_delegations (
+            delegation_id TEXT PRIMARY KEY, state TEXT, dispatched_at REAL, completed_at REAL,
+            updated_at REAL, delivery_state TEXT, delivery_attempts INTEGER, delivered_at REAL,
+            task_json TEXT, result_json TEXT, origin_session TEXT);
+    """)
+    done = NOW - 26 * H
+    goal = "Audit the FeedEcho retry path for duplicate deliveries and list every caller of deliver()."
+    conn.execute(
+        "INSERT OR REPLACE INTO async_delegations VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("deleg_demo_retry", "completed", done - 1800, done, done, "dropped", 8, None,
+         json.dumps({"goal": goal, "goals": [goal]}),
+         json.dumps({"results": [{"status": "completed", "summary":
+                                  "Three duplicate-delivery paths found. deliver() is called from "
+                                  "queue_worker.py:88 (no dedupe key), retry.py:41 (re-queues on a "
+                                  "409 instead of acking) and api.py:203 (manual resend). Adding the "
+                                  "item id as an idempotency key to all three closes it; retry.py:41 "
+                                  "also needs to treat 409 as success."}],
+                     "live_transcripts": ["/tmp/hermes-demo/deleg/deleg_demo_retry/task-0.log"]}),
+         "demo-session-1"))
+    conn.commit()
+    conn.close()
+
+
 def main():
     home = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/hermes-demo").expanduser()
     home.mkdir(parents=True, exist_ok=True)
     write_cron(home)
     write_chats(home)
     write_sessions(home)
+    write_delegations(home)
     write_profile(home)
     write_kanban(home)
     print(f"Demo Hermes home written to {home}")

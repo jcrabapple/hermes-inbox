@@ -11,6 +11,7 @@ const isNarrow = () => narrowMQ.matches;
 const SOURCE_META = {
   cron: { label: 'Scheduled runs', icon: 'clock' },
   scheduler: { label: 'Job health', icon: 'alert' },
+  delegation: { label: 'Delegations', icon: 'branch' },
   artifact: { label: 'Artifacts', icon: 'file' },
   kanban: { label: 'Kanban', icon: 'board' },
   note: { label: 'Notes', icon: 'note' },
@@ -30,6 +31,7 @@ const STATUS_TAG = {
   skipped: ['', 'Skipped'], silent: ['', 'Silent'], unchanged: ['', 'Same as last run'], empty: ['', 'No output'],
   missing: ['', 'File gone'], completed: ['ok', 'Completed'], attention: ['warn', 'Attention'], warning: ['warn', 'Warning'], error: ['warn', 'Error'],
   overdue: ['', 'Overdue'], failing: ['', 'Failing'], resolved: ['ok', 'Resolved'],
+  undelivered: ['', 'Not delivered'],
 };
 
 const state = {
@@ -470,6 +472,20 @@ function renderItem(it) {
       ['Board', esc(it.group_label)], ['Task', `<code>${esc(x.task_id)}</code>`], ['Worker', esc(x.profile)],
       ['Task status now', esc(x.task_status)], ['Run', `#${esc(x.run_id)}`], ['Ended', esc(fullTime(it.ts))],
     ]);
+  } else if (it.source === 'delegation') {
+    body += `<div class="md">${md(it.body)}</div>` + '<div class="section-title">Delegation</div>' + factRows([
+      ['Delegation', `<code>${esc(x.delegation_id)}</code>`],
+      ['Child state', esc(x.state)],
+      ['Delivery', x.delivery_state === 'dropped'
+        ? `dropped after ${x.attempts || 0} attempt${x.attempts === 1 ? '' : 's'}` : esc(x.delivery_state || 'pending')],
+      ['Dispatched', x.dispatched_at ? esc(fullTime(x.dispatched_at)) : ''],
+      ['Finished', x.completed_at ? esc(fullTime(x.completed_at)) : ''],
+      ['From session', x.origin_session ? `<code>${esc(x.origin_session)}</code>` : ''],
+    ]);
+    if (x.transcripts && x.transcripts.length) {
+      body += `<div class="section-title">Transcript${x.transcripts.length === 1 ? '' : 's'}</div>`
+        + `<ul class="sessions">${x.transcripts.map((t) => `<li><code>${esc(t)}</code></li>`).join('')}</ul>`;
+    }
   } else if (it.source === 'scheduler') {
     const jobLink = routeHash({ view: 'all', source: 'cron', group: it.group_key, profile: it.profile !== 'default' ? it.profile : '' });
     body += `<div class="md">${md(it.body)}</div>` + '<div class="section-title">Job</div>' + factRows([

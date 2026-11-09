@@ -76,13 +76,14 @@ class Indexer:
         if store.get_meta(self.conn, "backfill_cutoff") is None:
             store.set_meta(self.conn, "backfill_cutoff", started - BACKFILL_UNREAD_WINDOW)
             self.conn.commit()
-        counts = {"cron": 0, "artifact": 0, "kanban": 0, "scheduler": 0}
+        counts = {"cron": 0, "artifact": 0, "kanban": 0, "scheduler": 0, "delegation": 0}
         priced = 0
         for profile, home in sources.hermes_homes(self.root):
             counts["cron"] += self._index_cron(profile, home)
             counts["artifact"] += self._index_artifacts(profile, home)
             counts["kanban"] += self._index_kanban(profile, home)
             counts["scheduler"] += self._index_scheduler(profile, home)
+            counts["delegation"] += self._index_delegations(profile, home)
             priced += self._index_usage(profile, home)
         store.set_meta(self.conn, "last_index", {"at": time.time(), "took": round(time.time() - started, 2),
                                                  "new": counts, "priced": priced})
@@ -120,17 +121,18 @@ class Indexer:
             self.conn.commit()
         return added
 
-    def _index_scheduler(self, profile: str, home: Path) -> int:
-        """One durable item per broken job, resolved when the job recovers.
+    def _sync_incidents(self, source: str, profile: str, incidents: list[dict], resolved: str,
+                        backfill: bool = True) -> int:
+        """Upsert one durable item per incident and resolve the ones that cleared.
 
-        The ref is stable per (job, problem), so a job failing for two days stays one
-        item instead of one per index pass, and the incident keeps its original start
-        time instead of jumping to the top of the list every minute.
+        Refs are stable per problem, so an ongoing incident keeps its original start time
+        instead of jumping to the top of the list every pass. A resolved item that comes
+        back reopens as unread. backfill=False keeps old incidents unread: a lost result
+        is a discrete failure, not the routine volume the 48-hour rule exists to absorb.
         """
-        incidents = sources.scheduler_incidents(profile, sources.load_jobs(home))
         existing = {r["source_ref"]: r for r in self.conn.execute(
-            "SELECT id, source_ref, ts, status FROM items WHERE source='scheduler' AND profile=?",
-            (profile,))}
+            "SELECT id, source_ref, ts, status FROM items WHERE source=? AND profile=?",
+            (source, profile))}
         added, seen = 0, set()
         for item in incidents:
             seen.add(item["source_ref"])
@@ -140,18 +142,43 @@ class Indexer:
                 item["ts"] = old["ts"]  # ongoing incident: keep when it started
             if old is None or reopened:
                 added += 1
-            store.upsert_item(self.conn, item, read=self._initial_read(item["ts"]), reopen=reopened)
+            store.upsert_item(self.conn, item, read=backfill and self._initial_read(item["ts"]),
+                              reopen=reopened)
         for ref, old in existing.items():
             if ref in seen or old["status"] == "resolved":
                 continue
             self.conn.execute(
-                "UPDATE items SET status='resolved', attention=0, archived=1, "
-                "summary='No longer a problem: the job recovered, was disabled, or was removed.', "
+                "UPDATE items SET status='resolved', attention=0, archived=1, summary=?, "
                 "body=body || ? WHERE id=?",
-                (f"\n\n---\n\n**Resolved** {time.strftime('%a %d %b %H:%M')}: this job no longer reports "
-                 f"this problem.", old["id"]))
+                (resolved, f"\n\n---\n\n**Resolved** {time.strftime('%a %d %b %H:%M')}: {resolved}",
+                 old["id"]))
         self.conn.commit()
         return added
+
+    def _index_scheduler(self, profile: str, home: Path) -> int:
+        """Job health: one durable item per broken job, resolved when the job recovers."""
+        incidents = sources.scheduler_incidents(profile, sources.load_jobs(home))
+        return self._sync_incidents(
+            "scheduler", profile, incidents,
+            "No longer a problem: the job recovered, was disabled, or was removed.")
+
+    def _index_delegations(self, profile: str, home: Path) -> int:
+        """Results that never reached their conversation.
+
+        A missing state.db means the profile never used delegation; an unreadable one
+        must not resolve existing items, or a transient lock would tidy away real losses.
+        """
+        try:
+            incidents = sources.delegation_incidents(profile, home)
+        except sqlite3.Error as exc:
+            log.warning("delegations unreadable for %s: %s", profile, exc)
+            return 0
+        if incidents is None:
+            return 0
+        return self._sync_incidents(
+            "delegation", profile, incidents,
+            "Delivered: the result reached its conversation, or the record was pruned.",
+            backfill=False)
 
     def retitle_cron(self) -> int:
         """Recompute cron subjects/previews from stored bodies after the subject rules change."""
