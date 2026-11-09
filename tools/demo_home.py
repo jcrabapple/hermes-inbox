@@ -13,7 +13,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 NOW = time.time()
@@ -167,6 +167,15 @@ def write_cron(home: Path):
         jobs.append({"id": jid, "name": name, "enabled": True, "deliver": "local",
                      "schedule": {"kind": "cron", "display": sched}})
     (home / "cron").mkdir(parents=True, exist_ok=True)
+    # One job the scheduler itself calls broken, so Job health has something to show.
+    now = datetime.now()
+    jobs.append({"id": "d4a1b7c9e0f2", "name": "Nightly Backup Verify", "enabled": True,
+                 "deliver": "local", "schedule": {"kind": "cron", "display": "0 3 * * *"},
+                 "next_run_at": (now + timedelta(hours=6)).isoformat(),
+                 "last_run_at": (now - timedelta(minutes=95)).isoformat(),
+                 "last_status": "error", "failure_streak": 3,
+                 "last_error": "RuntimeError: restic snapshot not found for the last 24h",
+                 "last_failure": {"at": (now - timedelta(hours=1, minutes=35)).isoformat()}})
     (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": jobs}, indent=2))
     for idx, hours, kind, resp in RUNS:
         jid, name, sched = JOBS[idx]

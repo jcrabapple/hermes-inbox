@@ -157,7 +157,8 @@ class IndexTests(unittest.TestCase):
         counts = indexer.Indexer(self.conn, self.home).run()
         self.assertEqual(counts["cron"], 4)
         self.assertEqual(counts["artifact"], 1, "same file via MEDIA and preview dedupes to one item")
-        self.assertEqual(indexer.Indexer(self.conn, self.home).run(), {"cron": 0, "artifact": 0, "kanban": 0})
+        self.assertEqual(indexer.Indexer(self.conn, self.home).run(),
+                         {"cron": 0, "artifact": 0, "kanban": 0, "scheduler": 0})
         st = {r["source_ref"].split("/")[-1]: (r["status"], r["noise"], r["attention"])
               for r in self.conn.execute("SELECT * FROM items WHERE source='cron'")}
         self.assertEqual(st["2026-11-02_09-00-01.md"], ("failed", 0, 1))

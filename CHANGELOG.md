@@ -2,6 +2,24 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
+## 2.3.0 (2026-11-09)
+
+### Added
+- **Job health, a fourth source.** The inbox only sees runs that wrote an output file, so
+  a job that never fired was invisible. `cron/jobs.json` is now read for the scheduler's
+  own view: `next_run_at` more than an hour past (three intervals for fast interval jobs),
+  or `failure_streak` of two or more, opens one item per broken job. The ref is stable per
+  (job, problem), so an ongoing incident stays one item that keeps its original start time
+  rather than one per index pass; when the job recovers, is disabled or removed, the item
+  archives itself with a `Resolved` note, and a later outage reopens it as unread.
+  Disabled and paused jobs are ignored, and unparseable timestamps are skipped.
+- **Snooze.** A third triage state beside read and archive: postpone an item for an hour,
+  until tomorrow 9am or a week (`b`, or the clock button in the reader). Snoozed items drop
+  out of the inbox, attention and starred views and out of every badge, appear under a new
+  Snoozed view, and return on their own when the time passes. `POST /api/items/<id>` takes
+  `snoozed_until` (epoch seconds, or `null` to bring an item back); a past time is rejected.
+  The reader offers "Bring back now" and every snooze has an Undo.
+
 ## 2.2.0 (2026-11-02)
 
 ### Added

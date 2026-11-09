@@ -326,6 +326,132 @@ def iter_cron_files(home: Path):
         yield jobdir.name, sorted(files)
 
 
+# ── scheduled-job health ────────────────────────────────────────────────
+# A cron run reaches the inbox only by writing an output file, so a job that stopped
+# firing (dispatcher down, gateway wedged, job deleted from the queue) is invisible.
+# jobs.json knows: next_run_at, last_run_at, failure_streak, last_error. These readers
+# turn that state into one durable incident per job and problem.
+
+STREAK_ALERT = 2              # two failures in a row is a pattern, not a blip
+OVERDUE_GRACE = 3600          # a job an hour past its slot is not just slow
+OVERDUE_GRACE_MIN = 15 * 60   # floor, so a 5-minute poller does not flap
+
+
+def parse_iso(value) -> float | None:
+    """Epoch seconds from a Hermes timestamp (ISO string, or {'at': ISO, ...})."""
+    if isinstance(value, dict):
+        value = value.get("at")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def overdue_grace(job: dict) -> float:
+    """How late a job may be before it counts as not running.
+
+    Interval jobs get 3x their own period (never under 15 minutes), capped at an hour;
+    cron and one-shot jobs get the full hour because their period is unknown here.
+    """
+    sched = job.get("schedule") or {}
+    minutes = sched.get("minutes")
+    if sched.get("kind") == "interval" and isinstance(minutes, (int, float)) and minutes > 0:
+        return float(max(OVERDUE_GRACE_MIN, min(OVERDUE_GRACE, 3 * minutes * 60)))
+    return float(OVERDUE_GRACE)
+
+
+def _dur(seconds: float) -> str:
+    if seconds < 5400:
+        return f"{max(1, round(seconds / 60))} min"
+    if seconds < 172800:
+        return f"{round(seconds / 3600)} h"
+    return f"{round(seconds / 86400)} d"
+
+
+def _when(ts: float) -> str:
+    return time.strftime("%a %d %b %H:%M", time.localtime(ts))
+
+
+def scheduler_incidents(profile: str, jobs: dict, now: float | None = None) -> list[dict]:
+    """One item per (job, problem). Re-indexing the same problem reuses its ref."""
+    now = time.time() if now is None else now
+    out: list[dict] = []
+    for job_id, job in jobs.items():
+        if not job.get("enabled", True) or job.get("paused_at"):
+            continue  # a job nobody expects to run cannot be late or failing
+        name = job.get("name") or job_id
+        sched = job.get("schedule") or {}
+        schedule = sched.get("display") or job.get("schedule_display") or ""
+        last_run = parse_iso(job.get("last_run_at"))
+        last_status = job.get("last_status") or ""
+        extra = {
+            "job_id": job_id,
+            "schedule": schedule,
+            "deliver": job.get("deliver"),
+            "last_run_at": job.get("last_run_at"),
+            "last_status": last_status or None,
+            "next_run_at": job.get("next_run_at"),
+            "failure_streak": int(job.get("failure_streak") or 0),
+            "checked_at": now,
+        }
+
+        nxt = parse_iso(job.get("next_run_at"))
+        if nxt and now - nxt > overdue_grace(job):
+            late = now - nxt
+            out.append({
+                "source": "scheduler",
+                "source_ref": f"{profile}:{job_id}:overdue",
+                "title": f"Overdue by {_dur(late)}",
+                "summary": f"Was due {_when(nxt)}"
+                           + (f" · last run {_when(last_run)} ({last_status or 'unknown'})" if last_run else " · no run recorded"),
+                "body": (f"**This job was due {_when(nxt)} and has not run for {_dur(late)}.**\n\n"
+                         f"The scheduler still lists it as enabled, so either the dispatcher is not "
+                         f"firing, the job is stuck behind another long run, or its delivery is "
+                         f"failing before the run starts.\n\n"
+                         + (f"Last run: {_when(last_run)} ({last_status or 'unknown'}).\n\n" if last_run
+                            else "No run has ever been recorded for this job.\n\n")
+                         + f"Schedule: `{schedule or 'unknown'}`."),
+                "status": "overdue",
+                "attention": True,
+                "noise": False,
+                "group_key": job_id,
+                "group_label": name,
+                "profile": profile,
+                "ts": nxt,
+                "extra": {**extra, "kind": "overdue", "late_by": round(late)},
+            })
+
+        streak = int(job.get("failure_streak") or 0)
+        if streak >= STREAK_ALERT:
+            started = parse_iso(job.get("last_failure")) or last_run or now
+            err = job.get("last_error") or ""
+            if isinstance(job.get("last_failure"), dict) and not err:
+                err = job["last_failure"].get("detail") or ""
+            out.append({
+                "source": "scheduler",
+                "source_ref": f"{profile}:{job_id}:failing",
+                "title": f"Failed {streak} runs in a row",
+                "summary": (err.strip().splitlines() or [""])[0][:240],
+                "body": (f"**This job has failed {streak} consecutive runs.**\n\n"
+                         f"Failing since {_when(started)}"
+                         + (f"; last run {_when(last_run)}." if last_run else ".")
+                         + f"\n\nSchedule: `{schedule or 'unknown'}`.\n\n"
+                         + (f"Last error:\n\n```\n{err.strip()[:4000]}\n```" if err else "No error message was recorded.")
+                         ),
+                "status": "failing",
+                "attention": True,
+                "noise": False,
+                "group_key": job_id,
+                "group_label": name,
+                "profile": profile,
+                "ts": started,
+                "extra": {**extra, "kind": "failing", "last_error": err[:4000] or None},
+            })
+    return out
+
+
 # ── chat artifacts ───────────────────────────────────────────────────────
 
 def extract_paths(content: str, cwd: str | None) -> list[str]:

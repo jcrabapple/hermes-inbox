@@ -75,6 +75,7 @@ MIGRATIONS = (
     ("cost_usd", "REAL"),       # total cost of the run, all models and auxiliary tasks
     ("tokens_in", "INTEGER"),   # input + cache read + cache write
     ("tokens_out", "INTEGER"),  # output (reasoning included)
+    ("snoozed_until", "REAL"),  # epoch; the item is out of the views until then
 )
 POST_MIGRATION = """
 CREATE INDEX IF NOT EXISTS idx_items_cost ON items(source, ts) WHERE cost_usd IS NOT NULL;

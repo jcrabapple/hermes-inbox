@@ -28,7 +28,8 @@ STATIC = Path(__file__).resolve().parent / "static"
 COOKIE = "hermes_inbox"
 INDEX_INTERVAL = int(os.environ.get("HERMES_INBOX_INTERVAL", "60"))
 LIST_FIELDS = ("id", "source", "title", "summary", "status", "attention", "noise", "group_key",
-               "group_label", "profile", "ts", "read", "starred", "archived", "model", "cost_usd")
+               "group_label", "profile", "ts", "read", "starred", "archived", "model", "cost_usd",
+               "snoozed_until")
 PRUNE_INTERVAL = 3600
 USAGE_RUNS = "source='cron' AND json_extract(extra, '$.kind') IN ('agent', 'error')"
 PREVIEW_TEXT_LIMIT = 2_000_000
@@ -73,12 +74,17 @@ FTYPE_SQL = {
     "media": "(json_extract(extra,'$.mime') LIKE 'audio/%' OR json_extract(extra,'$.mime') LIKE 'video/%')",
 }
 
+# Snoozed items are out of every normal view until their time comes.
+ACTIVE_SQL = "(snoozed_until IS NULL OR snoozed_until <= strftime('%s','now'))"
+
 VIEW_SQL = {
-    "inbox": "archived=0 AND noise=0",
-    "unread": "archived=0 AND noise=0 AND read=0",
+    "inbox": "archived=0 AND noise=0 AND " + ACTIVE_SQL,
+    "unread": "archived=0 AND noise=0 AND read=0 AND " + ACTIVE_SQL,
     # Unread alerts plus anything flagged in the last week; older read alerts drop off.
-    "attention": "archived=0 AND attention=1 AND (read=0 OR ts > strftime('%s','now') - 604800)",
-    "starred": "starred=1",
+    "attention": "archived=0 AND attention=1 AND " + ACTIVE_SQL +
+                 " AND (read=0 OR ts > strftime('%s','now') - 604800)",
+    "starred": "starred=1 AND " + ACTIVE_SQL,
+    "snoozed": "snoozed_until IS NOT NULL AND snoozed_until > strftime('%s','now')",
     "archive": "archived=1",
     "all": "1=1",
 }
@@ -347,18 +353,20 @@ def make_handler(app: App):
             db = app.db()
             one = lambda sql, *a: db.execute(sql, a).fetchone()[0]
             views = {
-                "inbox": one("SELECT COUNT(*) FROM items WHERE archived=0 AND noise=0 AND read=0"),
-                "attention": one("SELECT COUNT(*) FROM items WHERE archived=0 AND attention=1 AND read=0"),
+                "inbox": one(f"SELECT COUNT(*) FROM items WHERE archived=0 AND noise=0 AND read=0 AND {ACTIVE_SQL}"),
+                "attention": one(f"SELECT COUNT(*) FROM items WHERE archived=0 AND attention=1 AND read=0 AND {ACTIVE_SQL}"),
                 "attention_total": one(f"SELECT COUNT(*) FROM items WHERE {VIEW_SQL['attention']}"),
-                "starred": one("SELECT COUNT(*) FROM items WHERE starred=1"),
+                "starred": one(f"SELECT COUNT(*) FROM items WHERE starred=1 AND {ACTIVE_SQL}"),
+                "snoozed": one(f"SELECT COUNT(*) FROM items WHERE archived=0 AND {VIEW_SQL['snoozed']}"),
                 "archive": one("SELECT COUNT(*) FROM items WHERE archived=1"),
             }
             sources_ = {r["source"]: {"unread": r["unread"], "total": r["total"]} for r in db.execute(
-                "SELECT source, SUM(read=0 AND noise=0 AND archived=0) unread, COUNT(*) total FROM items GROUP BY source")}
+                f"SELECT source, SUM(read=0 AND noise=0 AND archived=0 AND {ACTIVE_SQL}) unread, "
+                f"COUNT(*) total FROM items GROUP BY source")}
             groups = [dict(r) for r in db.execute(
-                """SELECT source, group_key, group_label, profile, COUNT(*) total,
-                          SUM(read=0 AND noise=0 AND archived=0) unread,
-                          SUM(attention=1 AND archived=0 AND read=0) attention, MAX(ts) last_ts
+                f"""SELECT source, group_key, group_label, profile, COUNT(*) total,
+                          SUM(read=0 AND noise=0 AND archived=0 AND {ACTIVE_SQL}) unread,
+                          SUM(attention=1 AND archived=0 AND read=0 AND {ACTIVE_SQL}) attention, MAX(ts) last_ts
                    FROM items WHERE source IN ('cron','kanban','note')
                    GROUP BY source, group_key, profile ORDER BY MAX(ts) DESC""")]
             # Use the most recent label for each group (job names get renamed).
@@ -367,7 +375,10 @@ def make_handler(app: App):
                                  "ORDER BY ts DESC LIMIT 1", (g["source"], g["group_key"], g["profile"])).fetchone()
                 g["group_label"], g["last_status"] = lab["group_label"], lab["status"]
             return {"views": views, "sources": sources_, "groups": groups,
-                    "last_index": store.get_meta(db, "last_index"), "now": time.time()}
+                    "last_index": store.get_meta(db, "last_index"), "now": time.time(),
+                    # Earliest moment a snoozed item comes back, so the client can refresh on time.
+                    "next_snooze": one("SELECT MIN(snoozed_until) FROM items "
+                                       f"WHERE {VIEW_SQL['snoozed']} AND archived=0")}
 
         def list_items(self, params):
             base, base_args = build_filter(params)
@@ -420,6 +431,19 @@ def make_handler(app: App):
                 if k in data:
                     sets.append(f"{k}=?")
                     args.append(1 if data[k] else 0)
+            if "snoozed_until" in data:
+                raw = data["snoozed_until"]
+                if raw in (None, 0, False, ""):
+                    sets.append("snoozed_until=NULL")
+                else:
+                    try:
+                        until = float(raw)
+                    except (TypeError, ValueError):
+                        return self._json({"error": "snoozed_until must be an epoch timestamp"}, 400)
+                    if until <= time.time():
+                        return self._json({"error": "snooze time must be in the future"}, 400)
+                    sets.append("snoozed_until=?")
+                    args.append(until)
             if not sets:
                 return self._json({"error": "nothing to update"}, 400)
             db = app.db()
