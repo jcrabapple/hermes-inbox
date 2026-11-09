@@ -1,3 +1,3 @@
 """Hermes Inbox: one inbox for everything a Hermes agent does."""
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"

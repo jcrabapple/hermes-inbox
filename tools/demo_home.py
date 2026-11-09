@@ -299,6 +299,15 @@ def write_delegations(home: Path):
     conn.close()
 
 
+def write_processes(home: Path):
+    """One checkpointed background process whose PID is long gone."""
+    (home / "processes.json").write_text(json.dumps([{
+        "session_id": "proc_9f2c44", "command": "pytest -x tests/ --watch",
+        "pid": 999999, "pid_scope": "host", "started_at": NOW - 3 * H,
+        "cwd": "/home/user/feedecho", "notify_on_complete": True,
+        "output_log": "/tmp/hermes-demo/processes/proc_9f2c44.log"}], indent=2))
+
+
 def main():
     home = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/hermes-demo").expanduser()
     home.mkdir(parents=True, exist_ok=True)
@@ -306,6 +315,7 @@ def main():
     write_chats(home)
     write_sessions(home)
     write_delegations(home)
+    write_processes(home)
     write_profile(home)
     write_kanban(home)
     print(f"Demo Hermes home written to {home}")

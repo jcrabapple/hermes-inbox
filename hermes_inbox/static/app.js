@@ -12,6 +12,7 @@ const SOURCE_META = {
   cron: { label: 'Scheduled runs', icon: 'clock' },
   scheduler: { label: 'Job health', icon: 'alert' },
   delegation: { label: 'Delegations', icon: 'branch' },
+  process: { label: 'Processes', icon: 'terminal' },
   artifact: { label: 'Artifacts', icon: 'file' },
   kanban: { label: 'Kanban', icon: 'board' },
   note: { label: 'Notes', icon: 'note' },
@@ -31,7 +32,11 @@ const STATUS_TAG = {
   skipped: ['', 'Skipped'], silent: ['', 'Silent'], unchanged: ['', 'Same as last run'], empty: ['', 'No output'],
   missing: ['', 'File gone'], completed: ['ok', 'Completed'], attention: ['warn', 'Attention'], warning: ['warn', 'Warning'], error: ['warn', 'Error'],
   overdue: ['', 'Overdue'], failing: ['', 'Failing'], resolved: ['ok', 'Resolved'],
-  undelivered: ['', 'Not delivered'], paused: ['', 'Paused'],
+  undelivered: ['', 'Not delivered'], paused: ['', 'Paused'], orphaned: ['', 'Orphaned'],
+};
+const STORE_LABELS = {
+  'jobs.json': 'the job queue', 'state.db': 'the session database',
+  'processes.json': 'the process registry', kanban: 'the kanban board',
 };
 
 const state = {
@@ -193,6 +198,7 @@ function renderNav() {
 
   const li = s.last_index;
   $('#index-status').textContent = li ? `Checked ${ago(li.at)}` : 'Indexing…';
+  renderSourceHealth(li);
   document.title = s.views.inbox ? `(${s.views.inbox}) Hermes Inbox` : 'Hermes Inbox';
 
   const tab = onPage || r.view === 'snoozed' ? 'more' : r.group ? '' : r.source === 'artifact' ? 'artifact' : r.source ? '' : r.view;
@@ -200,6 +206,23 @@ function renderNav() {
   $('[data-badge="inbox"]').textContent = s.views.inbox > 99 ? '99+' : s.views.inbox || '';
   $('[data-badge="attention"]').textContent = s.views.attention || '';
 }
+function renderSourceHealth(li) {
+  // A store that could not be read must not look like a quiet day.
+  const details = [];
+  for (const [prof, stores] of Object.entries((li && li.sources) || {})) {
+    for (const [store, status] of Object.entries(stores || {})) {
+      if (String(status).startsWith('unreadable')) {
+        details.push({ label: (STORE_LABELS[store] || store) + (prof !== 'default' ? ` (${prof})` : ''),
+          text: `${prof}: ${store} ${status}` });
+      }
+    }
+  }
+  const el = $('#source-health');
+  el.hidden = !details.length;
+  el.textContent = details.length ? `Couldn't read ${details.map((d) => d.label).join(', ')}` : '';
+  el.title = details.map((d) => d.text).join('\n');
+}
+
 let snoozeTimer;
 function scheduleSnoozeRefresh() {
   // Snoozed items come back on their own; refresh when the earliest one is due.
@@ -486,6 +509,16 @@ function renderItem(it) {
       body += `<div class="section-title">Transcript${x.transcripts.length === 1 ? '' : 's'}</div>`
         + `<ul class="sessions">${x.transcripts.map((t) => `<li><code>${esc(t)}</code></li>`).join('')}</ul>`;
     }
+  } else if (it.source === 'process') {
+    body += `<div class="md">${md(it.body)}</div>` + '<div class="section-title">Process</div>' + factRows([
+      ['ID', `<code>${esc(x.process_id)}</code>`],
+      ['PID', x.pid ? `${esc(x.pid)} <span class="tag">${esc(x.pid_state)}</span>` : ''],
+      ['Started', x.started_at ? esc(fullTime(x.started_at)) : ''],
+      ['Working dir', x.cwd ? `<code>${esc(x.cwd)}</code>` : ''],
+      ['Notify on complete', x.notify_on_complete ? 'yes' : ''],
+      ['Output log', x.output_log ? `<code>${esc(x.output_log)}</code>` : ''],
+      ['Checked', x.checked_at ? esc(fullTime(x.checked_at)) : ''],
+    ]);
   } else if (it.source === 'scheduler') {
     const jobLink = routeHash({ view: 'all', source: 'cron', group: it.group_key, profile: it.profile !== 'default' ? it.profile : '' });
     body += `<div class="md">${md(it.body)}</div>` + '<div class="section-title">Job</div>' + factRows([

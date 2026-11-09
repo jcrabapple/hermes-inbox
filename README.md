@@ -43,6 +43,7 @@ place, keeps its own copy, and lets you triage it like email: read, star, archiv
 | **Kanban** | finished `task_runs` across `kanban.db` and `kanban/boards/*/kanban.db` | worker run |
 | **Job health** | `cron/jobs.json` in every profile: `next_run_at`, `failure_streak`, `paused_at`, `paused_reason` | broken or paused job, not broken run |
 | **Delegations** | `async_delegations` in every profile's `state.db` | result that never reached its chat |
+| **Processes** | `processes.json` in every profile | background process left in the registry after it died |
 | **Notes** | `hermes-inbox post …` or `POST /api/notes` from any script | note |
 
 Hermes databases are opened **read-only**. Nothing under your Hermes home is ever written.
@@ -75,6 +76,18 @@ Hermes databases are opened **read-only**. Nothing under your Hermes home is eve
   `state.db` never resolves one: a transient lock must not tidy away a real loss. Unlike
   every other source, an old undelivered result is not filed as read on first index, since
   the 48-hour backfill rule exists to absorb routine volume, not discrete failures.
+- **Orphaned background processes.** `processes.json` is a checkpoint of processes that had
+  not exited when it was written, and a crashed owner stops rewriting it. Any entry whose
+  host PID is gone, or whose PID has since been recycled by another process, becomes an
+  item with the command, working directory, age and output log. Sandboxed PIDs (which mean
+  nothing outside their environment), entries with a recorded exit marker, and processes
+  that started seconds ago are left alone, and the item clears itself when the registry is
+  rewritten.
+- **It says when it could not look.** Every index pass records how each store read
+  (`jobs.json`, `state.db`, `kanban.db`, `processes.json`), and the sidebar footer names any
+  that failed, with the reason in the tooltip. A corrupt database or an unreadable job queue
+  otherwise looks exactly like a quiet day. A store that opened fine but has no table yet
+  counts as empty, not broken.
 - **Every profile, one inbox.** Cron jobs, artifacts and state from all Hermes profiles
   (`~/.hermes/profiles/*`) are indexed alongside the default home and tagged with the
   profile name. Once a second profile has cron activity, a filter row appears at the top
@@ -215,7 +228,7 @@ JSON body.
 
 | Method | Path | |
 |---|---|---|
-| `GET` | `/api/summary` | Counts per view, source and job; last index pass |
+| `GET` | `/api/summary` | Counts per view, source and job; the last index pass, including how each store read |
 | `GET` | `/api/items?view=&source=&group=&profile=&q=&ftype=&noise=1&before=` | Paged list. `view`: `inbox`, `attention`, `starred`, `snoozed`, `all`, `archive` |
 | `GET` | `/api/items/<id>` | One item with its full body |
 | `GET` | `/api/items/<id>/file[?download=1]` | An artifact's file (only paths the agent published) |
@@ -279,6 +292,7 @@ by a script gate never call a model, so they have no cost.
   cron/output/*/*.md            │
   cron/jobs.json (job health)   │
   state.db (files, cost, delegations)
+  processes.json (orphans)      │
   kanban/**/kanban.db           │
                                 ▼
                      inbox.db (SQLite + FTS5, read/star/archive/snooze state)

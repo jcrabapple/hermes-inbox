@@ -34,7 +34,7 @@ def fingerprint(root: Path) -> str:
     """
     parts = []
     for profile, home in sources.hermes_homes(root):
-        for p in (home / "cron" / "jobs.json", home / "state.db"):
+        for p in (home / "cron" / "jobs.json", home / "state.db", home / "processes.json"):
             try:
                 parts.append(f"{profile}:j:{p.name}:{p.stat().st_mtime_ns}")
             except OSError:
@@ -76,19 +76,33 @@ class Indexer:
         if store.get_meta(self.conn, "backfill_cutoff") is None:
             store.set_meta(self.conn, "backfill_cutoff", started - BACKFILL_UNREAD_WINDOW)
             self.conn.commit()
-        counts = {"cron": 0, "artifact": 0, "kanban": 0, "scheduler": 0, "delegation": 0}
+        counts = {"cron": 0, "artifact": 0, "kanban": 0, "scheduler": 0, "delegation": 0,
+                  "process": 0}
+        # How each store read this pass: read / absent / unreadable (why). The UI shows
+        # the unreadable ones so a broken store cannot look like a quiet day.
+        self.health: dict[str, dict[str, str]] = {}
         priced = 0
         for profile, home in sources.hermes_homes(self.root):
-            counts["cron"] += self._index_cron(profile, home)
+            jobs, job_status = sources.read_jobs(home)
+            self._mark(profile, "jobs.json", job_status)
+            counts["cron"] += self._index_cron(profile, home, jobs)
             counts["artifact"] += self._index_artifacts(profile, home)
             counts["kanban"] += self._index_kanban(profile, home)
-            counts["scheduler"] += self._index_scheduler(profile, home)
+            counts["scheduler"] += self._index_scheduler(profile, jobs)
             counts["delegation"] += self._index_delegations(profile, home)
+            counts["process"] += self._index_processes(profile, home)
             priced += self._index_usage(profile, home)
         store.set_meta(self.conn, "last_index", {"at": time.time(), "took": round(time.time() - started, 2),
-                                                 "new": counts, "priced": priced})
+                                                 "new": counts, "priced": priced,
+                                                 "sources": self.health})
         self.conn.commit()
         return counts
+
+    def _mark(self, profile: str, store_name: str, status: str) -> None:
+        cur = self.health.setdefault(profile, {}).get(store_name, "")
+        if cur.startswith("unreadable") and status == "read":
+            return  # one reader failing this pass is the honest answer
+        self.health[profile][store_name] = status
 
     # cron ────────────────────────────────────────────────────────────
     def _last_hash(self, profile: str, job_id: str) -> str | None:
@@ -99,8 +113,7 @@ class Indexer:
         ).fetchone()
         return json.loads(row["extra"]).get("hash") if row else None
 
-    def _index_cron(self, profile: str, home: Path) -> int:
-        jobs = sources.load_jobs(home)
+    def _index_cron(self, profile: str, home: Path, jobs: dict) -> int:
         known = store.known_refs(self.conn, "cron")
         added = 0
         for job_dir, files in sources.iter_cron_files(home):
@@ -155,9 +168,9 @@ class Indexer:
         self.conn.commit()
         return added
 
-    def _index_scheduler(self, profile: str, home: Path) -> int:
-        """Job health: one durable item per broken job, resolved when the job recovers."""
-        incidents = sources.scheduler_incidents(profile, sources.load_jobs(home))
+    def _index_scheduler(self, profile: str, jobs: dict) -> int:
+        """Job health: one durable item per broken or paused job."""
+        incidents = sources.scheduler_incidents(profile, jobs)
         return self._sync_incidents(
             "scheduler", profile, incidents,
             "No longer a problem: the job is running again, was disabled, or was removed.")
@@ -165,19 +178,40 @@ class Indexer:
     def _index_delegations(self, profile: str, home: Path) -> int:
         """Results that never reached their conversation.
 
-        A missing state.db means the profile never used delegation; an unreadable one
-        must not resolve existing items, or a transient lock would tidy away real losses.
+        A missing state.db or table means the profile never used delegation; an
+        unreadable one must not resolve existing items, or a transient lock would tidy
+        away real losses.
         """
         try:
             incidents = sources.delegation_incidents(profile, home)
         except sqlite3.Error as exc:
+            self._mark(profile, "state.db", f"unreadable ({str(exc)[:120]})")
             log.warning("delegations unreadable for %s: %s", profile, exc)
             return 0
         if incidents is None:
+            self._mark(profile, "state.db",
+                       "read" if (home / "state.db").exists() else "absent")
             return 0
+        self._mark(profile, "state.db", "read")
         return self._sync_incidents(
             "delegation", profile, incidents,
             "Delivered: the result reached its conversation, or the record was pruned.",
+            backfill=False)
+
+    def _index_processes(self, profile: str, home: Path) -> int:
+        """Registry entries whose process is gone.
+
+        Absent means Hermes has never checkpointed a process here; unreadable means the
+        file exists but could not be parsed, and either way existing items are left alone.
+        """
+        entries, status = sources.read_processes(home)
+        self._mark(profile, "processes.json", status)
+        if status != "read":
+            return 0
+        incidents = sources.process_incidents(profile, entries)
+        return self._sync_incidents(
+            "process", profile, incidents,
+            "No longer a problem: the registry entry is gone, or the process is running again.",
             backfill=False)
 
     def retitle_cron(self) -> int:
@@ -245,17 +279,25 @@ class Indexer:
         return json.loads(row["extra"]) if row else None
 
     def _index_artifacts(self, profile: str, home: Path) -> int:
+        if not (home / "state.db").exists():
+            self._mark(profile, "state.db", "absent")
+            return 0
         key = f"cursor:messages:{profile}"
         cursor = store.get_meta(self.conn, key, 0)
-        # state.db ids can go backwards only if the DB was rebuilt; restart then.
-        if cursor > sources.max_message_id(home):
-            cursor = 0
         added, last = 0, cursor
         try:
+            # state.db ids can go backwards only if the DB was rebuilt; restart then.
+            if cursor > sources.max_message_id(home):
+                cursor = 0
             mentions = list(sources.iter_artifact_mentions(home, cursor))
         except sqlite3.Error as exc:
+            if sources.is_missing_table(exc):
+                self._mark(profile, "state.db", "read")  # opened fine, just nothing in it
+                return 0
+            self._mark(profile, "state.db", f"unreadable ({str(exc)[:120]})")
             log.warning("state.db read failed for %s: %s", profile, exc)
             return 0
+        self._mark(profile, "state.db", "read")
         for msg_id, mention in mentions:
             existing = self._existing_extra("artifact", mention["path"])
             item, reopen = sources.artifact_item(mention, profile, existing)
@@ -287,13 +329,20 @@ class Indexer:
     # kanban ──────────────────────────────────────────────────────────
     def _index_kanban(self, profile: str, home: Path) -> int:
         added = 0
-        for board, db, label in sources.kanban_dbs(home):
+        boards = list(sources.kanban_dbs(home))
+        if not boards:
+            self._mark(profile, "kanban", "absent")
+            return 0
+        bad: str | None = None
+        for board, db, label in boards:
             key = f"cursor:kanban:{profile}:{board}"
             cursor = store.get_meta(self.conn, key, 0)
             last = cursor
             try:
                 runs = list(sources.iter_kanban_runs(board, db, cursor, label))
             except sqlite3.Error as exc:
+                if not sources.is_missing_table(exc):
+                    bad = bad or str(exc)
                 log.warning("kanban read failed %s/%s: %s", profile, board, exc)
                 continue
             for run_id, item, artifacts, attachments in runs:
@@ -308,6 +357,7 @@ class Indexer:
             if runs:
                 store.set_meta(self.conn, key, last)
             self.conn.commit()
+        self._mark(profile, "kanban", f"unreadable ({bad[:120]})" if bad else "read")
         return added
 
     def _kanban_artifact(self, profile, board, run_item, path, name=None):

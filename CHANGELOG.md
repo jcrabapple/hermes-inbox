@@ -2,6 +2,27 @@
 
 All notable changes to Hermes Inbox. Versions follow [Semantic Versioning](https://semver.org).
 
+## 2.6.0 (2026-11-09)
+
+### Added
+- **Orphaned background processes, a sixth source.** `processes.json` checkpoints the
+  processes that had not exited when it was written; a crashed owner stops rewriting it, so
+  entries can outlive their PIDs. Any host entry whose PID is gone, or whose PID has been
+  recycled (kernel start time no longer matches `host_start_time`), becomes an item with the
+  command, working directory, age, output log and whether completion notification was on.
+  Sandboxed PIDs, entries with a recorded `.exit` marker and processes started less than two
+  minutes ago are left alone. Items resolve when the registry entry disappears. Absent or
+  unreadable `processes.json` leaves existing items untouched.
+- **Source health in the footer.** Each index pass records `read` / `absent` /
+  `unreadable (why)` per store per profile, stored in `last_index.sources` and exposed by
+  `/api/summary`. The sidebar shows "Couldn't read …" in the warning colour when any store
+  failed, with profile, store and reason in the tooltip. A store that opened but has no table
+  yet now counts as empty rather than unreadable, so a fresh profile does not raise a false
+  alarm. A corrupt `state.db` no longer aborts the index pass either: the artifact reader
+  reports it and the rest of the pass finishes.
+- `tests/test_v7.py` covers the PID probe (gone / recycled / running / sandboxed), the grace
+  and exit-marker rules, index lifecycle, and the health map (88 tests total).
+
 ## 2.5.0 (2026-11-09)
 
 ### Added

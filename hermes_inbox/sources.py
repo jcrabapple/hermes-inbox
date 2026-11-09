@@ -48,6 +48,11 @@ def ro_connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def is_missing_table(exc: BaseException) -> bool:
+    """A store that opened fine but has no table yet is empty, not unreadable."""
+    return "no such table" in str(exc).lower()
+
+
 def hermes_homes(root: Path):
     """Yield (profile_name, home_path) for the default home and every profile."""
     yield "default", root
@@ -217,13 +222,22 @@ def parse_cron_output(text: str) -> dict:
 
 
 def load_jobs(home: Path) -> dict[str, dict]:
+    return read_jobs(home)[0]
+
+
+def read_jobs(home: Path) -> tuple[dict[str, dict], str]:
+    """Job records plus how the file read went: read / absent / unreadable (why)."""
     path = home / "cron" / "jobs.json"
+    if not path.exists():
+        return {}, "absent"
     try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        return {}, f"unreadable ({type(exc).__name__})"
     jobs = data.get("jobs", data) if isinstance(data, dict) else data
-    return {j.get("id"): j for j in jobs if isinstance(j, dict) and j.get("id")}
+    if not isinstance(jobs, list):
+        return {}, "unreadable (not a list)"
+    return {j.get("id"): j for j in jobs if isinstance(j, dict) and j.get("id")}, "read"
 
 
 BOILERPLATE_RE = re.compile(r"^(generated|report generated|run time|date|timestamp)\b", re.I)
@@ -620,6 +634,131 @@ def delegation_incidents(profile: str, home: Path, now: float | None = None) -> 
             "profile": profile,
             "ts": finished or now,
             "extra": {**extra, "kind": "dropped" if dropped else "pending"},
+        })
+    return out
+
+
+# ── background processes ────────────────────────────────────────────────
+# processes.json is a checkpoint of processes that had not exited when it was written.
+# A crashed owner stops rewriting it, which strands entries whose PID is long gone.
+
+ORPHAN_GRACE = 120  # a process that just exited is usually rewritten out of the checkpoint
+
+
+def _proc_start_ticks(pid: int) -> int | None:
+    """Kernel start time for a PID (clock ticks since boot), Linux only."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19])  # starttime is field 22 of proc(5), state is field 3
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def host_pid_state(pid, expected_start=None) -> str:
+    """'running' | 'gone' | 'reused' | 'unknown' for a host PID.
+
+    Mirrors Hermes' own recovery rule: a start-time probe that cannot be read is not
+    proof of reuse, so it counts as running. Never invent an exit.
+    """
+    if os.name == "nt":
+        return "unknown"  # os.kill(pid, 0) is not a liveness probe on Windows
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return "unknown"
+    if pid <= 0:
+        return "gone"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        pass  # alive, owned by another user
+    except OSError:
+        return "unknown"
+    if not isinstance(expected_start, int) or isinstance(expected_start, bool):
+        return "running"
+    actual = _proc_start_ticks(pid)
+    if actual is None:
+        return "running"
+    return "running" if actual == expected_start else "reused"
+
+
+def read_processes(home: Path) -> tuple[list[dict], str]:
+    """Registry entries plus how the file read went: read / absent / unreadable (why)."""
+    path = home / "processes.json"
+    if not path.exists():
+        return [], "absent"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        return [], f"unreadable ({type(exc).__name__})"
+    if not isinstance(data, list):
+        return [], "unreadable (not a list)"
+    return [e for e in data if isinstance(e, dict)], "read"
+
+
+def process_incidents(profile: str, entries: list[dict], now: float | None = None) -> list[dict]:
+    """Checkpoint entries whose process is gone. One item per stranded entry."""
+    now = time.time() if now is None else now
+    out: list[dict] = []
+    for e in entries:
+        if e.get("pid_scope", "host") != "host":
+            continue  # an in-sandbox PID means nothing out here
+        pid = e.get("pid")
+        if not pid:
+            continue
+        started = e.get("started_at")
+        if isinstance(started, (int, float)) and now - started < ORPHAN_GRACE:
+            continue
+        state = host_pid_state(pid, e.get("host_start_time"))
+        if state not in ("gone", "reused"):
+            continue
+        output_log = e.get("output_log")
+        if isinstance(output_log, str) and output_log:
+            try:
+                if Path(output_log).with_suffix(".exit").exists():
+                    continue  # the child recorded its exit; the entry is a handoff, not an orphan
+            except OSError:
+                pass
+        command = " ".join(str(e.get("command") or "").split())
+        key = e.get("session_id") or f"pid-{pid}"
+        extra = {
+            "process_id": key,
+            "pid": pid,
+            "pid_state": state,
+            "started_at": started,
+            "cwd": e.get("cwd"),
+            "output_log": output_log,
+            "notify_on_complete": bool(e.get("notify_on_complete")),
+            "checked_at": now,
+        }
+        when = (f"It was started {_when(started)} (PID {pid})" if isinstance(started, (int, float))
+                else f"It was recorded with PID {pid}")
+        ending = ("; that number now belongs to a different process." if state == "reused"
+                  else " and it no longer exists.")
+        body = ("**This background process is listed in the registry, but its PID is gone.**\n\n"
+                + (f"```\n{command[:2000]}\n```\n\n" if command else "")
+                + when + ending
+                + "\n\nThe checkpoint listing it was written before it died and has not been "
+                  "rewritten since, so nothing is going to report on it. If it was doing work "
+                  "you still need, that work did not finish.\n\n"
+                + (f"Output log: `{output_log}`" if isinstance(output_log, str) and output_log else ""))
+        out.append({
+            "source": "process",
+            "source_ref": f"{profile}:{key}",
+            "title": (f"Process gone: {command[:80]}" if command else f"Process gone (pid {pid})"),
+            "summary": (f"PID {pid}"
+                        + (f" · started {_when(started)} ({_dur(now - started)} ago)" if isinstance(started, (int, float)) else "")),
+            "body": body,
+            "status": "orphaned",
+            "attention": True,
+            "noise": False,
+            "group_key": key,
+            "group_label": "Background processes",
+            "profile": profile,
+            "ts": started if isinstance(started, (int, float)) else now,
+            "extra": extra,
         })
     return out
 
